@@ -790,6 +790,78 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_summary_falls_back_to_summary_records(self, urlopen: mock.Mock) -> None:
+        first = mock.Mock()
+        first.__enter__ = mock.Mock(return_value=first)
+        first.__exit__ = mock.Mock(return_value=False)
+        first.read.return_value = json.dumps({"response": "{"}).encode("utf-8")
+
+        second = mock.Mock()
+        second.__enter__ = mock.Mock(return_value=second)
+        second.__exit__ = mock.Mock(return_value=False)
+        second.read.return_value = json.dumps(
+            {
+                "response": (
+                    "summary|Focus on sequence and hidden-gem artifacts\n"
+                    "priority|ctf_cases/sequence/ctf/sequence.txt|Contains a suspicious cookie trail\n"
+                    "review|ctf_cases/sequence/ctf/sequence.txt\n"
+                )
+            }
+        ).encode("utf-8")
+        urlopen.side_effect = [first, second]
+
+        summary = cli.request_agent_summary(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            {"instructions": ["Return executive_summary, priority_findings, relationships, review_order"]},
+            model_retries=0,
+        )
+
+        self.assertEqual(summary["executive_summary"], "Focus on sequence and hidden-gem artifacts")
+        self.assertEqual(summary["priority_findings"][0]["source_path"], "ctf_cases/sequence/ctf/sequence.txt")
+        self.assertEqual(summary["review_order"], ["ctf_cases/sequence/ctf/sequence.txt"])
+
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_summary_uses_deterministic_fallback_after_empty_outputs(self, urlopen: mock.Mock) -> None:
+        first = mock.Mock()
+        first.__enter__ = mock.Mock(return_value=first)
+        first.__exit__ = mock.Mock(return_value=False)
+        first.read.return_value = json.dumps({"response": "{"}).encode("utf-8")
+
+        second = mock.Mock()
+        second.__enter__ = mock.Mock(return_value=second)
+        second.__exit__ = mock.Mock(return_value=False)
+        second.read.return_value = json.dumps({"response": ""}).encode("utf-8")
+        urlopen.side_effect = [first, second]
+
+        summary = cli.request_agent_summary(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            {
+                "findings": [
+                    {
+                        "source": "docs/a.txt",
+                        "category": "credential",
+                        "severity": "high",
+                        "evidence": "password=secret",
+                    }
+                ],
+                "agent_observations": [
+                    {
+                        "path": "docs/a.txt",
+                        "source_mechanism": "read_head",
+                        "derived_claim": "Contains a password",
+                        "evidence": "password=secret",
+                    }
+                ],
+            },
+            model_retries=0,
+        )
+
+        self.assertIn("Deterministic fallback summary", summary["executive_summary"])
+        self.assertEqual(summary["priority_findings"][0]["source_path"], "docs/a.txt")
+
+    @mock.patch("doc_triage.cli.urlopen")
     def test_request_agent_summary_uses_configured_retry_budget(self, urlopen: mock.Mock) -> None:
         first = mock.Mock()
         first.__enter__ = mock.Mock(return_value=first)
@@ -852,6 +924,29 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0].source_mechanism, "generated_python_helper")
         self.assertIn("helper_source_hash", observations[0].metadata)
+
+    def test_summarize_observations_for_llm_bounds_evidence(self) -> None:
+        observations = [
+            cli.AgentObservation(
+                path="docs/a.txt",
+                evidence="A" * 500,
+                source_mechanism="read_head",
+                confidence=0.9,
+                derived_claim="Contains a token",
+            ),
+            cli.AgentObservation(
+                path="docs/b.txt",
+                evidence="B" * 20,
+                source_mechanism="read_head",
+                confidence=0.5,
+            ),
+        ]
+
+        summarized = cli.summarize_observations_for_llm(observations, max_items=1, evidence_limit=80)
+
+        self.assertEqual(len(summarized), 1)
+        self.assertEqual(summarized[0]["path"], "docs/a.txt")
+        self.assertLessEqual(len(summarized[0]["evidence"]), 80)
 
     def test_parse_generated_helper_output_warns_on_record_truncation(self) -> None:
         payload = "\n".join(
