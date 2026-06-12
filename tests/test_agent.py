@@ -100,6 +100,22 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(any(action.kind == "content_search" for action in actions))
         self.assertTrue(any(action.path == "loot.txt" for action in actions))
 
+    def test_build_fallback_agent_plan_chooses_email_parse_for_eml(self) -> None:
+        recon = {
+            "top_directories": [],
+            "representative_heads": [{"path": "mail/message.eml", "preview": "From: a@example.com"}],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / "mail").mkdir()
+            (target / "mail" / "message.eml").write_text(
+                "From: a@example.com\nTo: b@example.com\nSubject: hi\n\nbody\n",
+                encoding="utf-8",
+            )
+            _, actions = cli.build_fallback_agent_plan(target, [], recon, action_budget=3)
+
+        self.assertEqual(actions[0].kind, "email_parse")
+
     def test_parse_agent_hypotheses_accepts_string_entries(self) -> None:
         hypotheses = cli.parse_agent_hypotheses(["look for hidden archives"])
 
@@ -170,6 +186,35 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].metadata["timeout_seconds"], "7")
+
+    def test_parse_agent_plan_lines_accepts_glm_key_value_format(self) -> None:
+        payload = (
+            "hypothesis|label=Investigate CTF files|rationale=The target contains multiple cases.|status=proposed\n"
+            "action|kind=dir_list|target_or_query=/tmp/case|reason=Explore structure.|limit=1|timeout_seconds=5\n"
+            "action|kind=file_info|target_or_query=/tmp/case/file.jpg|reason=Get metadata.|limit=1|timeout_seconds=5\n"
+        )
+
+        hypotheses, actions = cli.parse_agent_plan_lines(payload)
+
+        self.assertEqual(len(hypotheses), 1)
+        self.assertEqual(hypotheses[0].label, "Investigate CTF files")
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(actions[0].kind, "dir_list")
+        self.assertEqual(actions[1].kind, "file_info")
+        self.assertEqual(actions[1].path, "/tmp/case/file.jpg")
+
+    def test_parse_agent_plan_lines_accepts_glm_kind_first_format(self) -> None:
+        payload = (
+            "dir_list|label=List target contents.|rationale=Start with directory context.|status=not_started\n"
+            "file_info|kind=file_info|target_or_query=/tmp/case/file.jpg|reason=Inspect metadata.|limit=1|timeout_seconds=5\n"
+        )
+
+        hypotheses, actions = cli.parse_agent_plan_lines(payload)
+
+        self.assertEqual(len(hypotheses), 1)
+        self.assertEqual(hypotheses[0].label, "List target contents.")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "file_info")
 
     def test_merge_agent_actions_backfills_with_fallback(self) -> None:
         merged = cli.merge_agent_actions(
@@ -257,6 +302,64 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0].source_mechanism, "dir_list")
+
+    @mock.patch("doc_triage.cli.run_command")
+    def test_execute_agent_actions_skips_strings_on_image_targets(self, run_command: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            image = target / "photo.jpg"
+            image.write_bytes(b"\xff\xd8\xff")
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="strings_head", path="photo.jpg", reason="inspect image strings", limit=5)],
+                per_action_timeout=5,
+            )
+
+        self.assertEqual(observations, [])
+        self.assertIn("use exiftool_info or image_ocr_light", " ".join(warnings))
+        run_command.assert_not_called()
+
+    @mock.patch("doc_triage.cli.run_command")
+    @mock.patch("doc_triage.cli.shutil.which", side_effect=lambda name: "/usr/bin/exiftool" if name == "exiftool" else None)
+    def test_execute_agent_actions_runs_exiftool_on_images(self, _: mock.Mock, run_command: mock.Mock) -> None:
+        run_command.return_value = cli.CommandResult(
+            exit_code=0,
+            stdout="File Type                       : JPEG\nComment                         : hidden note",
+            stderr="",
+            timed_out=False,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            image = target / "photo.jpg"
+            image.write_bytes(b"\xff\xd8\xff")
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="exiftool_info", path="photo.jpg", reason="inspect metadata", limit=5)],
+                per_action_timeout=5,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source_mechanism, "exiftool_info")
+
+    def test_execute_agent_actions_parses_eml_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            mail = target / "message.eml"
+            mail.write_text(
+                "From: a@example.com\nTo: b@example.com\nSubject: hi\n\nbody text\n",
+                encoding="utf-8",
+            )
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="email_parse", path="message.eml", reason="inspect email", limit=5)],
+                per_action_timeout=5,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertIn("Subject: hi", observations[0].evidence)
+        self.assertIn("body text", observations[0].evidence)
 
     def test_validate_generated_helper_source_rejects_unsafe_constructs(self) -> None:
         errors = cli.validate_generated_helper_source("import subprocess\nprint('nope')\n")

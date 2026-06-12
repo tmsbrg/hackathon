@@ -8,7 +8,8 @@ EXIT_ERROR = 1
 EXIT_USAGE = 2
 
 REQUIRED_TOOLS = ("rg", "rga", "trufflehog")
-OPTIONAL_OCR_TOOLS = ("tesseract", "ocrmypdf", "pdftotext")
+OPTIONAL_OCR_TOOLS = ("tesseract", "ocrmypdf", "pdftotext", "exiftool")
+ARCHIVE_EXTENSIONS = {".zip", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".rar"}
 TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".conf", ".log", ".ini", ".json", ".yaml", ".yml", ".csv"}
 OCR_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 OCR_PDF_EXTENSIONS = {".pdf"}

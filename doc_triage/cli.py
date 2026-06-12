@@ -11,12 +11,15 @@ import sys
 import tempfile
 from collections import Counter
 from dataclasses import asdict
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from typing import Sequence
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from .constants import (
+    ARCHIVE_EXTENSIONS,
     EXIT_ERROR,
     EXIT_OK,
     EXIT_USAGE,
@@ -590,6 +593,13 @@ def parse_agent_hypotheses(payload: object) -> list[AgentHypothesis]:
 
 
 def parse_agent_actions(payload: object) -> list[AgentAction]:
+    def _clean_field(value: str) -> str:
+        stripped = value.strip()
+        for prefix in ("target_or_query:", "path:", "query:", "kind:", "reason:", "label:", "rationale:", "status:"):
+            if stripped.lower().startswith(prefix):
+                return stripped[len(prefix) :].strip()
+        return stripped
+
     if not isinstance(payload, list):
         return []
     actions: list[AgentAction] = []
@@ -597,11 +607,11 @@ def parse_agent_actions(payload: object) -> list[AgentAction]:
         if not isinstance(item, dict):
             continue
         args = item.get("args") if isinstance(item.get("args"), dict) else {}
-        kind = str(item.get("kind") or item.get("action") or item.get("name") or "").strip()
-        path = str(item.get("path") or item.get("target") or args.get("path") or ".").strip() or "."
-        query = str(item.get("query") or item.get("pattern") or item.get("regex") or args.get("query") or args.get("pattern") or "").strip()
+        kind = _clean_field(str(item.get("kind") or item.get("action") or item.get("name") or ""))
+        path = _clean_field(str(item.get("path") or item.get("target") or args.get("path") or ".").strip() or ".")
+        query = _clean_field(str(item.get("query") or item.get("pattern") or item.get("regex") or args.get("query") or args.get("pattern") or ""))
         code = str(item.get("code") or args.get("code") or "").strip()
-        reason = str(item.get("reason") or item.get("why") or item.get("description") or item.get("rationale") or "").strip()
+        reason = _clean_field(str(item.get("reason") or item.get("why") or item.get("description") or item.get("rationale") or ""))
         limit = item.get("limit", args.get("limit", 20))
         timeout_seconds = item.get("timeout_seconds", item.get("timeout", args.get("timeout_seconds", args.get("timeout", 0))))
         if not isinstance(limit, int):
@@ -655,6 +665,18 @@ def normalize_agent_plan_payload(payload: dict[str, object]) -> dict[str, object
 
 
 def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[AgentAction]]:
+    def _parse_kv_parts(parts: list[str]) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for part in parts[1:]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+            elif ":" in part:
+                key, value = part.split(":", 1)
+            else:
+                continue
+            mapping[key.strip().lower()] = value.strip()
+        return mapping
+
     def _parse_numeric(value: str, prefix: str, default: int) -> int:
         stripped = value.strip()
         if stripped.startswith(prefix):
@@ -683,6 +705,42 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
             continue
         parts = [part.strip() for part in line.split("|")]
         record_type = parts[0].lower()
+        if record_type.startswith("---"):
+            continue
+        if record_type in AGENT_ACTION_KINDS:
+            kv = _parse_kv_parts(parts)
+            if "target_or_query" in kv or "path" in kv or "query" in kv:
+                target_value = kv.get("target_or_query") or kv.get("path") or kv.get("query") or "."
+                reason = kv.get("reason") or kv.get("label") or f"Investigate {target_value} via {record_type}."
+                limit = _parse_numeric(kv.get("limit", "20"), "", 20)
+                timeout_seconds = _parse_numeric(kv.get("timeout_seconds", "0"), "", 0)
+                payload_item = {
+                    "kind": kv.get("kind") or record_type,
+                    "reason": reason,
+                    "limit": limit,
+                    "timeout_seconds": timeout_seconds,
+                }
+                if record_type in {"content_search", "filename_search"}:
+                    payload_item["query"] = target_value
+                else:
+                    payload_item["path"] = target_value
+                actions.extend(parse_agent_actions([payload_item]))
+                continue
+            label = kv.get("label", "").strip()
+            rationale = kv.get("rationale", "").strip()
+            status = kv.get("status", "inconclusive").strip() or "inconclusive"
+            if label and rationale:
+                hypotheses.append(AgentHypothesis(label=label, rationale=rationale, status=status))
+                continue
+        if record_type == "hypothesis":
+            kv = _parse_kv_parts(parts)
+            if kv:
+                label = kv.get("label", "").strip()
+                rationale = kv.get("rationale", "").strip()
+                status = kv.get("status", "inconclusive").strip() or "inconclusive"
+                if label and rationale:
+                    hypotheses.append(AgentHypothesis(label=label, rationale=rationale, status=status))
+                continue
         if record_type.startswith("hyp_") and len(parts) >= 6:
             label = parts[2] or parts[1]
             status = parts[3] or "inconclusive"
@@ -740,6 +798,26 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
                 )
             )
             continue
+        if record_type == "action":
+            kv = _parse_kv_parts(parts)
+            if kv:
+                kind = kv.get("kind", "")
+                target_value = kv.get("target_or_query") or kv.get("path") or kv.get("query") or "."
+                reason = kv.get("reason", "") or f"Investigate {target_value} via {kind}."
+                limit = _parse_numeric(kv.get("limit", "20"), "", 20)
+                timeout_seconds = _parse_numeric(kv.get("timeout_seconds", "0"), "", 0)
+                payload_item = {
+                    "kind": kind,
+                    "reason": reason,
+                    "limit": limit,
+                    "timeout_seconds": timeout_seconds,
+                }
+                if kind in {"content_search", "filename_search"}:
+                    payload_item["query"] = target_value
+                else:
+                    payload_item["path"] = target_value
+                actions.extend(parse_agent_actions([payload_item]))
+                continue
         if record_type != "action" or len(parts) < 4:
             continue
         kind = parts[1]
@@ -814,6 +892,51 @@ def build_fallback_agent_plan(
     recon: dict[str, object],
     action_budget: int,
 ) -> tuple[list[AgentHypothesis], list[AgentAction]]:
+    def _fallback_action_for_path(relative_path: str) -> AgentAction:
+        candidate = safe_relative_path(target, relative_path)
+        target_type = classify_agent_target(candidate) if candidate is not None and candidate.exists() else "text"
+        if target_type == "email":
+            return AgentAction(
+                kind="email_parse",
+                path=relative_path,
+                reason="Parse email headers, body, and attachment indicators from a representative email artifact.",
+                limit=20,
+            )
+        if target_type == "image":
+            return AgentAction(
+                kind="image_ocr_light",
+                path=relative_path,
+                reason="Extract text from a representative image artifact.",
+                limit=20,
+            )
+        if target_type == "pdf":
+            return AgentAction(
+                kind="pdf_text_head",
+                path=relative_path,
+                reason="Extract representative PDF text for triage.",
+                limit=20,
+            )
+        if target_type == "archive":
+            return AgentAction(
+                kind="zip_list",
+                path=relative_path,
+                reason="List archive members for a representative packaged artifact.",
+                limit=20,
+            )
+        if target_type == "binary":
+            return AgentAction(
+                kind="file_info",
+                path=relative_path,
+                reason="Inspect metadata for a representative binary artifact before deeper extraction.",
+                limit=5,
+            )
+        return AgentAction(
+            kind="read_head",
+            path=relative_path,
+            reason="Inspect a representative file from the dataset profile.",
+            limit=20,
+        )
+
     hypotheses: list[AgentHypothesis] = []
     actions: list[AgentAction] = []
     if findings:
@@ -852,14 +975,7 @@ def build_fallback_agent_plan(
             path = str(item.get("path") or "").strip()
             if not path:
                 continue
-            actions.append(
-                AgentAction(
-                    kind="read_head",
-                    path=path,
-                    reason="Inspect a representative file from the dataset profile.",
-                    limit=20,
-                )
-            )
+            actions.append(_fallback_action_for_path(path))
     if findings:
         query_terms = {"cookie", "session", "token", "password", "key"}
         for finding in findings[:3]:
@@ -1047,6 +1163,9 @@ AGENT_ACTION_KINDS = {
     "zip_list",
     "pdf_text_head",
     "file_info",
+    "email_parse",
+    "exiftool_info",
+    "image_ocr_light",
     "dir_list",
     "content_search",
     "filename_search",
@@ -1056,11 +1175,14 @@ AGENT_ACTION_TIMEOUT_DEFAULTS = {
     "read_head": 5,
     "dir_list": 5,
     "file_info": 5,
+    "email_parse": 8,
+    "exiftool_info": 8,
     "strings_head": 15,
     "filename_search": 15,
     "zip_list": 20,
     "content_search": 20,
     "pdf_text_head": 25,
+    "image_ocr_light": 25,
     "generated_python_helper": 30,
 }
 
@@ -1300,6 +1422,65 @@ def parse_content_search_output(payload: str) -> list[tuple[str, int | None, str
     return matches
 
 
+def is_text_like_path(candidate: Path) -> bool:
+    return candidate.suffix.lower() in TEXT_EXTENSIONS
+
+
+def classify_agent_target(candidate: Path) -> str:
+    suffix = candidate.suffix.lower()
+    if suffix == ".eml":
+        return "email"
+    if suffix in OCR_IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in OCR_PDF_EXTENSIONS:
+        return "pdf"
+    if suffix in ARCHIVE_EXTENSIONS:
+        return "archive"
+    if is_text_like_path(candidate):
+        return "text"
+    mime_guess = mimetypes.guess_type(candidate.name)[0] or ""
+    if mime_guess == "message/rfc822":
+        return "email"
+    if mime_guess.startswith("image/"):
+        return "image"
+    if mime_guess == "application/pdf":
+        return "pdf"
+    if mime_guess.startswith("text/"):
+        return "text"
+    return "binary"
+
+
+def validate_agent_action_target(action: AgentAction, candidate: Path | None) -> str | None:
+    if action.kind in {"content_search", "filename_search", "generated_python_helper"}:
+        return None
+    if candidate is None or not candidate.exists():
+        return f"agent action skipped missing path: {action.kind} {action.path}"
+    if action.kind == "dir_list":
+        if candidate.is_dir():
+            return None
+        return f"agent action skipped incompatible target: {action.kind} {action.path}"
+    if candidate.is_dir():
+        if action.kind in {"read_head", "file_info"}:
+            return None
+        return f"agent action skipped incompatible target: {action.kind} {action.path}"
+    target_type = classify_agent_target(candidate)
+    if action.kind == "read_head" and target_type not in {"text"}:
+        return f"agent action skipped incompatible target: {action.kind} {action.path} ({target_type})"
+    if action.kind == "email_parse" and target_type != "email":
+        return f"agent action skipped incompatible target: {action.kind} {action.path} ({target_type})"
+    if action.kind == "strings_head" and target_type in {"image", "pdf"}:
+        return f"agent action skipped incompatible target: {action.kind} {action.path} ({target_type}); use exiftool_info or image_ocr_light"
+    if action.kind == "zip_list" and target_type != "archive":
+        return f"agent action skipped incompatible target: {action.kind} {action.path} ({target_type})"
+    if action.kind == "pdf_text_head" and target_type != "pdf":
+        return f"agent action skipped incompatible target: {action.kind} {action.path} ({target_type})"
+    if action.kind == "image_ocr_light" and target_type != "image":
+        return f"agent action skipped incompatible target: {action.kind} {action.path} ({target_type})"
+    if action.kind == "exiftool_info" and target_type not in {"image", "pdf", "archive", "binary"}:
+        return f"agent action skipped incompatible target: {action.kind} {action.path} ({target_type})"
+    return None
+
+
 def execute_agent_actions(
     target: Path,
     actions: list[AgentAction],
@@ -1317,6 +1498,10 @@ def execute_agent_actions(
             warnings.append(f"unsupported agent action: {action.kind}")
             continue
         candidate = safe_relative_path(target, action.path) if action.path not in {"", "."} else target
+        target_warning = validate_agent_action_target(action, candidate)
+        if target_warning is not None:
+            warnings.append(target_warning)
+            continue
         try:
             if action.kind == "generated_python_helper":
                 generated_observations, helper_warnings = execute_generated_helper(
@@ -1423,6 +1608,96 @@ def execute_agent_actions(
                 )
                 if result.timed_out:
                     warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
+            elif action.kind == "email_parse" and candidate is not None:
+                payload = candidate.read_bytes()
+                message = BytesParser(policy=policy.default).parsebytes(payload)
+                headers = []
+                for key in ("From", "To", "Subject", "Date", "Message-ID"):
+                    value = message.get(key)
+                    if value:
+                        headers.append(f"{key}: {value}")
+                body = ""
+                if message.is_multipart():
+                    for part in message.walk():
+                        if part.get_content_maintype() == "multipart":
+                            continue
+                        if part.get_content_disposition() == "attachment":
+                            continue
+                        try:
+                            body = part.get_content()
+                        except Exception:
+                            continue
+                        if isinstance(body, str) and body.strip():
+                            break
+                else:
+                    try:
+                        content = message.get_content()
+                        if isinstance(content, str):
+                            body = content
+                    except Exception:
+                        body = ""
+                attachments = [part.get_filename() for part in message.iter_attachments() if part.get_filename()]
+                evidence = "\n".join(headers)
+                if attachments:
+                    evidence += ("\nAttachments: " + ", ".join(attachments))
+                if body.strip():
+                    evidence += "\n\n" + body[: min(action.limit * 120, 4000)]
+                observations.append(
+                    normalize_agent_observation(
+                        path=relative_source(target, candidate),
+                        evidence=evidence.strip(),
+                        source_mechanism="email_parse",
+                        confidence=0.75,
+                        derived_claim=action.reason,
+                        metadata={"timeout_seconds": str(action_timeout)},
+                    )
+                )
+            elif action.kind == "exiftool_info" and candidate is not None:
+                exiftool_path = shutil.which("exiftool")
+                if exiftool_path is None:
+                    warnings.append(f"agent action skipped unavailable tool: exiftool for {action.path}")
+                    continue
+                result = run_command([exiftool_path, str(candidate)], timeout=action_timeout, max_output_chars=3000)
+                observations.append(
+                    normalize_agent_observation(
+                        path=relative_source(target, candidate),
+                        evidence=result.stdout.strip() or result.stderr.strip(),
+                        source_mechanism="exiftool_info",
+                        confidence=0.65,
+                        derived_claim=action.reason,
+                        exit_status=result.exit_code,
+                        truncated=result.metadata.get("stdout_truncated", False),
+                        metadata={"timeout_seconds": str(action_timeout)},
+                    )
+                )
+                if result.timed_out:
+                    warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
+            elif action.kind == "image_ocr_light" and candidate is not None:
+                tesseract_path = shutil.which("tesseract")
+                if tesseract_path is None:
+                    warnings.append(f"agent action skipped unavailable tool: tesseract for {action.path}")
+                    continue
+                with tempfile.TemporaryDirectory(prefix="doc-triage-agent-image-ocr-") as temp_dir:
+                    stem = Path(temp_dir) / candidate.stem
+                    result = run_command([tesseract_path, str(candidate), str(stem)], timeout=action_timeout, max_output_chars=2000)
+                    text_path = stem.with_suffix(".txt")
+                    evidence = result.stderr or "tesseract failed"
+                    if result.exit_code == 0 and text_path.exists():
+                        evidence = text_path.read_text(encoding="utf-8", errors="ignore")[: min(action.limit * 120, 4000)]
+                    observations.append(
+                        normalize_agent_observation(
+                            path=relative_source(target, candidate),
+                            evidence=evidence,
+                            source_mechanism="image_ocr_light",
+                            confidence=0.6,
+                            derived_claim=action.reason,
+                            exit_status=result.exit_code,
+                            truncated=result.metadata.get("stdout_truncated", False),
+                            metadata={"timeout_seconds": str(action_timeout)},
+                        )
+                    )
+                    if result.timed_out:
+                        warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
             elif action.kind == "dir_list" and candidate is not None and candidate.is_dir():
                 entries = sorted(path.name for path in candidate.iterdir())[: action.limit]
                 observations.append(
@@ -1568,6 +1843,7 @@ def build_agent_plan_prompt(
             "Return newline-delimited proposal records only.",
             "Formats: hypothesis|label|rationale|status and action|kind|target_or_query|reason|limit|timeout_seconds.",
             "Use only supported action kinds and no more than the provided action budget.",
+            "Choose file-type-appropriate actions: use image_ocr_light or exiftool_info for images, email_parse for .eml, pdf_text_head for PDFs, zip_list for archives, file_info when unsure, and avoid read_head or strings_head on images.",
         ],
         "target": str(target),
         "action_budget": action_budget,
@@ -1599,6 +1875,7 @@ def build_agent_refinement_prompt(
             "Return newline-delimited proposal records only.",
             "Formats: hypothesis|label|rationale|status and action|kind|target_or_query|reason|limit|timeout_seconds.",
             "Avoid repeating previous actions.",
+            "Choose file-type-appropriate actions: use image_ocr_light or exiftool_info for images, email_parse for .eml, pdf_text_head for PDFs, zip_list for archives, file_info when unsure, and avoid read_head or strings_head on images.",
         ],
         "target": str(target),
         "remaining_action_budget": remaining_action_budget,
