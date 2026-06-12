@@ -177,6 +177,8 @@ def summarize_findings(
             f"  Agent mode: actions={len(agent_run.actions)} observations={len(agent_run.observations)} "
             f"confirmed_hypotheses={confirmed}"
         )
+        for summary in agent_run.role_summaries[:3]:
+            lines.append(f"    - subagent {summary}")
         if agent_run.warnings:
             for warning in agent_run.warnings[:3]:
                 lines.append(f"    - {warning}")
@@ -347,13 +349,18 @@ def render_report(
         lines.extend(["", "## Agent Investigation Plan"])
         if agent_run.hypotheses:
             for hypothesis in agent_run.hypotheses:
-                lines.append(f"- [{hypothesis.status}] {hypothesis.label}: {hypothesis.rationale}")
+                role_prefix = f"{hypothesis.role} " if hypothesis.role else ""
+                lines.append(f"- [{hypothesis.status}] {role_prefix}{hypothesis.label}: {hypothesis.rationale}")
         else:
             lines.append("- No agent hypotheses recorded.")
+        if agent_run.role_summaries:
+            for summary in agent_run.role_summaries:
+                lines.append(f"  - subagent={summary}")
         if agent_run.actions:
             for action in agent_run.actions:
                 target_label = action.query or action.path
-                lines.append(f"  - action={action.kind} target={target_label} reason={action.reason}")
+                role_suffix = f" role={action.role}" if action.role else ""
+                lines.append(f"  - action={action.kind} target={target_label}{role_suffix} reason={action.reason}")
 
         lines.extend(["", "## Agent Observations"])
         if agent_run.observations:

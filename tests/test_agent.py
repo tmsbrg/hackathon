@@ -136,13 +136,14 @@ class AgentModeTests(unittest.TestCase):
 
     def test_summarize_agent_plan_natural_language_describes_actions(self) -> None:
         summary = cli.summarize_agent_plan_natural_language(
-            [cli.AgentHypothesis(label="review backups", rationale="credentials may be there")],
+            [cli.AgentHypothesis(label="review backups", rationale="credentials may be there", role="archive_analyst")],
             [
                 cli.AgentAction(kind="zip_list", path="IT/backups/nightly.zip", reason="inspect archive"),
                 cli.AgentAction(kind="content_search", query="password", reason="search secrets"),
             ],
         )
 
+        self.assertIn("subagents archive_analyst", summary)
         self.assertIn("investigate review backups", summary)
         self.assertIn("inspect archive IT/backups/nightly.zip", summary)
         self.assertIn("search for password", summary)
@@ -152,6 +153,7 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertEqual(len(hypotheses), 1)
         self.assertEqual(hypotheses[0].label, "look for hidden archives")
+        self.assertEqual(hypotheses[0].role, "archive_analyst")
 
     def test_parse_agent_actions_accepts_target_and_default_reason(self) -> None:
         actions = cli.parse_agent_actions(
@@ -181,6 +183,16 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(actions[0].kind, "read_head")
         self.assertEqual(actions[0].path, "docs/a.txt")
         self.assertEqual(actions[0].limit, 7)
+        self.assertEqual(actions[0].role, "document_analyst")
+
+    def test_parse_agent_plan_lines_accepts_role_annotated_records(self) -> None:
+        hypotheses, actions = cli.parse_agent_plan_lines(
+            "hypothesis|VPN creds nearby|Helpdesk email suggests access reuse|inconclusive|credential_hunter\n"
+            "action|content_search|Welkom123|search likely reused password|10|12|credential_hunter\n"
+        )
+
+        self.assertEqual(hypotheses[0].role, "credential_hunter")
+        self.assertEqual(actions[0].role, "credential_hunter")
 
     def test_build_agent_plan_prompt_preserves_safety_instructions_with_malicious_preview(self) -> None:
         prompt = cli.build_agent_plan_prompt(
@@ -248,14 +260,14 @@ class AgentModeTests(unittest.TestCase):
     @mock.patch("doc_triage.cli.request_agent_plan")
     def test_plan_hypothesis_fanout_actions_adds_unique_actions(self, request_agent_plan: mock.Mock) -> None:
         request_agent_plan.return_value = (
-            [cli.AgentHypothesis(label="archive lead", rationale="Check archives")],
+            [cli.AgentHypothesis(label="archive lead", rationale="Check archives", role="archive_analyst")],
             [
-                cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="Inspect archive"),
-                cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="duplicate"),
+                cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="Inspect archive", role="archive_analyst"),
+                cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="duplicate", role="archive_analyst"),
             ],
         )
         args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
-        hypotheses = [cli.AgentHypothesis(label="archive lead", rationale="Check archives")]
+        hypotheses = [cli.AgentHypothesis(label="archive lead", rationale="Check archives", role="archive_analyst")]
         existing = [cli.AgentAction(kind="dir_list", path="Archives", reason="Survey archives")]
 
         focused_hypotheses, actions, warnings = cli.plan_hypothesis_fanout_actions(
@@ -271,7 +283,34 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].kind, "zip_list")
+        self.assertEqual(actions[0].role, "archive_analyst")
         self.assertEqual(focused_hypotheses, [])
+
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    def test_plan_hypothesis_fanout_actions_groups_hypotheses_by_role(self, request_agent_plan: mock.Mock) -> None:
+        request_agent_plan.side_effect = [
+            ([], [cli.AgentAction(kind="content_search", query="token", reason="hunt token reuse", role="credential_hunter")]),
+            ([], [cli.AgentAction(kind="dir_list", path="HR", reason="inspect HR docs", role="identity_reviewer")]),
+        ]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        hypotheses = [
+            cli.AgentHypothesis(label="VPN token reuse", rationale="Helpdesk mail mentions login tokens", role="credential_hunter"),
+            cli.AgentHypothesis(label="Payroll records", rationale="HR material may hold identifiers", role="identity_reviewer"),
+        ]
+
+        _, actions, warnings = cli.plan_hypothesis_fanout_actions(
+            Path("/tmp/case"),
+            {"representative_heads": []},
+            [],
+            [],
+            hypotheses,
+            [],
+            args,
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(request_agent_plan.call_count, 2)
+        self.assertEqual({action.role for action in actions}, {"credential_hunter", "identity_reviewer"})
 
     def test_parse_agent_actions_normalizes_zip_list_directory_target(self) -> None:
         actions = cli.parse_agent_actions(

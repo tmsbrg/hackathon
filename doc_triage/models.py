@@ -44,6 +44,7 @@ class AgentHypothesis:
     label: str
     rationale: str
     status: str = "inconclusive"
+    role: str = ""
     evidence_paths: list[str] = field(default_factory=list)
     notes: str = ""
 
@@ -52,6 +53,7 @@ class AgentHypothesis:
 class AgentAction:
     kind: str
     reason: str
+    role: str = ""
     path: str = "."
     query: str = ""
     limit: int = 20
@@ -78,6 +80,7 @@ class AgentRun:
     actions: list[AgentAction] = field(default_factory=list)
     observations: list[AgentObservation] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    role_summaries: list[str] = field(default_factory=list)
     llm_summary: dict[str, object] | None = None
     reviewed_findings: list[Finding] = field(default_factory=list)
     removed_findings: list[Finding] = field(default_factory=list)
