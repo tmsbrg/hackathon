@@ -184,7 +184,8 @@ def summarize_findings(
                 lines.append(f"    - {warning}")
         for observation in agent_run.observations[:3]:
             label = observation.derived_claim or observation.source_mechanism
-            lines.append(f"    - {observation.path} [{label}]")
+            role_suffix = f" role={observation.role}" if observation.role else ""
+            lines.append(f"    - {observation.path} [{label}]{role_suffix}")
             lines.append(f"      Evidence: {summarize_evidence(observation.evidence)}")
     return lines
 
@@ -365,9 +366,10 @@ def render_report(
         lines.extend(["", "## Agent Observations"])
         if agent_run.observations:
             for observation in agent_run.observations[:20]:
+                role_suffix = f" role={observation.role}" if observation.role else ""
                 lines.append(
                     f"- {observation.path} via {observation.source_mechanism} "
-                    f"(confidence={observation.confidence:.2f})"
+                    f"(confidence={observation.confidence:.2f}{role_suffix})"
                 )
                 if observation.derived_claim:
                     lines.append(f"  Claim: {observation.derived_claim}")

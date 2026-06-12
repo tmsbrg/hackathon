@@ -67,6 +67,7 @@ class AgentObservation:
     evidence: str
     source_mechanism: str
     confidence: float
+    role: str = ""
     derived_claim: str = ""
     action_kind: str = ""
     exit_status: int = 0

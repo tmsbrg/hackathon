@@ -193,6 +193,18 @@ def build_role_plan_summary(hypotheses: Sequence["AgentHypothesis"], actions: Se
     return summaries
 
 
+def group_actions_by_role(actions: Sequence["AgentAction"]) -> list[tuple[str, list[AgentAction]]]:
+    grouped: dict[str, list[AgentAction]] = {}
+    order: list[str] = []
+    for action in actions:
+        role = action.role.strip() or infer_agent_role(action.reason, source=action.query or action.path)
+        if role not in grouped:
+            grouped[role] = []
+            order.append(role)
+        grouped[role].append(action)
+    return [(role, grouped[role]) for role in order]
+
+
 def render_agent_plan_records(hypotheses: Sequence["AgentHypothesis"], actions: Sequence["AgentAction"]) -> str:
     records: list[str] = []
     for hypothesis in hypotheses:
@@ -2313,6 +2325,7 @@ def normalize_agent_observation(
     source_mechanism: str,
     confidence: float,
     derived_claim: str = "",
+    role: str = "",
     *,
     action_kind: str = "",
     exit_status: int = 0,
@@ -2324,6 +2337,7 @@ def normalize_agent_observation(
         evidence=evidence.rstrip(),
         source_mechanism=source_mechanism,
         confidence=confidence,
+        role=role,
         derived_claim=derived_claim,
         action_kind=action_kind or source_mechanism,
         exit_status=exit_status,
@@ -2538,6 +2552,7 @@ def parse_generated_helper_output(payload: str, max_records: int = 20) -> tuple[
                 evidence=evidence,
                 source_mechanism="generated_python_helper",
                 confidence=float(record.get("confidence") or 0.6),
+                role=str(record.get("role") or ""),
                 derived_claim=str(record.get("derived_claim") or ""),
                 truncated=False,
                 metadata={key: str(value) for key, value in record.items() if key not in {"path", "evidence", "confidence", "derived_claim"}},
@@ -2672,6 +2687,7 @@ def execute_generated_helper(
             result = run_command(command, timeout=timeout_seconds + 5, max_output_chars=16000)
             observations, parse_warnings = parse_generated_helper_output(result.stdout)
             for observation in observations:
+                observation.role = observation.role or current_action.role or infer_agent_role(current_action.reason, source=current_action.query or current_action.path)
                 observation.truncated = result.metadata.get("stdout_truncated", False) or observation.truncated
                 observation.exit_status = result.exit_code
                 observation.metadata["helper_source_hash"] = source_hash
@@ -2881,6 +2897,7 @@ def execute_agent_actions(
     observations: list[AgentObservation] = []
     warnings: list[str] = []
     for action in deduplicate_agent_actions(actions):
+        action_role = action.role.strip() or infer_agent_role(action.reason, source=action.query or action.path)
         action_timeout = resolve_action_timeout(action, per_action_timeout)
         if action.kind not in AGENT_ACTION_KINDS:
             warnings.append(f"unsupported agent action: {action.kind}")
@@ -2913,6 +2930,7 @@ def execute_agent_actions(
                         evidence="\n".join(entries),
                         source_mechanism="dir_list",
                         confidence=0.5,
+                        role=action_role,
                         derived_claim=action.reason,
                         metadata={"timeout_seconds": str(action_timeout)},
                     )
@@ -2926,6 +2944,7 @@ def execute_agent_actions(
                         evidence=output,
                         source_mechanism="read_head",
                         confidence=0.7,
+                        role=action_role,
                         derived_claim=action.reason,
                         metadata={"timeout_seconds": str(action_timeout)},
                     )
@@ -2938,6 +2957,7 @@ def execute_agent_actions(
                         evidence="\n".join(result.stdout.splitlines()[: action.limit]),
                         source_mechanism="strings_head",
                         confidence=0.65,
+                        role=action_role,
                         derived_claim=action.reason,
                         truncated=result.metadata.get("stdout_truncated", False),
                         exit_status=result.exit_code,
@@ -2954,6 +2974,7 @@ def execute_agent_actions(
                         evidence=result.stdout or result.stderr,
                         source_mechanism="zip_list",
                         confidence=0.6,
+                        role=action_role,
                         derived_claim=action.reason,
                         truncated=result.metadata.get("stdout_truncated", False),
                         exit_status=result.exit_code,
@@ -2975,6 +2996,7 @@ def execute_agent_actions(
                             evidence=evidence,
                             source_mechanism="pdf_text_head",
                             confidence=0.6,
+                            role=action_role,
                             derived_claim=action.reason,
                             exit_status=result.exit_code,
                             metadata={"timeout_seconds": str(action_timeout)},
@@ -2990,6 +3012,7 @@ def execute_agent_actions(
                         evidence=result.stdout.strip() or result.stderr.strip(),
                         source_mechanism="file_info",
                         confidence=0.55,
+                        role=action_role,
                         derived_claim=action.reason,
                         exit_status=result.exit_code,
                         metadata={"timeout_seconds": str(action_timeout)},
@@ -3037,6 +3060,7 @@ def execute_agent_actions(
                         evidence=evidence.strip(),
                         source_mechanism="email_parse",
                         confidence=0.75,
+                        role=action_role,
                         derived_claim=action.reason,
                         metadata={"timeout_seconds": str(action_timeout)},
                     )
@@ -3053,6 +3077,7 @@ def execute_agent_actions(
                         evidence=result.stdout.strip() or result.stderr.strip(),
                         source_mechanism="exiftool_info",
                         confidence=0.65,
+                        role=action_role,
                         derived_claim=action.reason,
                         exit_status=result.exit_code,
                         truncated=result.metadata.get("stdout_truncated", False),
@@ -3074,14 +3099,15 @@ def execute_agent_actions(
                     if result.exit_code == 0 and text_path.exists():
                         evidence = text_path.read_text(encoding="utf-8", errors="ignore")[: min(action.limit * 120, 4000)]
                     observations.append(
-                        normalize_agent_observation(
-                            path=relative_source(target, candidate),
-                            evidence=evidence,
-                            source_mechanism="image_ocr_light",
-                            confidence=0.6,
-                            derived_claim=action.reason,
-                            exit_status=result.exit_code,
-                            truncated=result.metadata.get("stdout_truncated", False),
+                    normalize_agent_observation(
+                        path=relative_source(target, candidate),
+                        evidence=evidence,
+                        source_mechanism="image_ocr_light",
+                        confidence=0.6,
+                        role=action_role,
+                        derived_claim=action.reason,
+                        exit_status=result.exit_code,
+                        truncated=result.metadata.get("stdout_truncated", False),
                             metadata={"timeout_seconds": str(action_timeout)},
                         )
                     )
@@ -3095,6 +3121,7 @@ def execute_agent_actions(
                         evidence="\n".join(entries),
                         source_mechanism="dir_list",
                         confidence=0.5,
+                        role=action_role,
                         derived_claim=action.reason,
                         metadata={"timeout_seconds": str(action_timeout)},
                     )
@@ -3112,6 +3139,7 @@ def execute_agent_actions(
                             evidence=evidence,
                             source_mechanism="content_search",
                             confidence=0.75,
+                            role=action_role,
                             derived_claim=action.reason,
                             metadata={
                                 "line": str(line_no) if line_no is not None else "",
@@ -3136,6 +3164,7 @@ def execute_agent_actions(
                             evidence=line,
                             source_mechanism="filename_search",
                             confidence=0.7,
+                            role=action_role,
                             derived_claim=action.reason,
                             exit_status=result.exit_code,
                             truncated=result.metadata.get("stdout_truncated", False),
@@ -3557,15 +3586,25 @@ def run_agent_mode(
         "agent",
         f"Executing initial actions ({len(actions)}): {', '.join(summarize_agent_action(action) for action in actions[:6])}",
     )
-    observations, action_warnings = execute_agent_actions(
-        target,
-        actions,
-        args.agent_timeout,
-        ollama_url=args.ollama_url,
-        model=args.model,
-        model_retries=args.model_retries,
-        verbose=args.verbose,
-    )
+    observations: list[AgentObservation] = []
+    action_warnings: list[str] = []
+    for role, role_actions in group_actions_by_role(actions):
+        progress_log(
+            args.verbose,
+            "agent",
+            f"Executing subagent {role} actions ({len(role_actions)}): {', '.join(summarize_agent_action(action) for action in role_actions[:4])}",
+        )
+        role_observations, role_warnings = execute_agent_actions(
+            target,
+            role_actions,
+            args.agent_timeout,
+            ollama_url=args.ollama_url,
+            model=args.model,
+            model_retries=args.model_retries,
+            verbose=args.verbose,
+        )
+        observations.extend(role_observations)
+        action_warnings.extend(role_warnings)
     warnings.extend(action_warnings)
     progress_log(
         args.verbose,
@@ -3621,15 +3660,25 @@ def run_agent_mode(
             "agent",
             f"Executing follow-up actions ({len(second_batch)}): {', '.join(summarize_agent_action(action) for action in second_batch[:6])}",
         )
-    followup_observations, followup_warnings = execute_agent_actions(
-        target,
-        second_batch,
-        args.agent_timeout,
-        ollama_url=args.ollama_url,
-        model=args.model,
-        model_retries=args.model_retries,
-        verbose=args.verbose,
-    )
+    followup_observations: list[AgentObservation] = []
+    followup_warnings: list[str] = []
+    for role, role_actions in group_actions_by_role(second_batch):
+        progress_log(
+            args.verbose,
+            "agent",
+            f"Executing follow-up subagent {role} actions ({len(role_actions)}): {', '.join(summarize_agent_action(action) for action in role_actions[:4])}",
+        )
+        role_observations, role_warnings = execute_agent_actions(
+            target,
+            role_actions,
+            args.agent_timeout,
+            ollama_url=args.ollama_url,
+            model=args.model,
+            model_retries=args.model_retries,
+            verbose=args.verbose,
+        )
+        followup_observations.extend(role_observations)
+        followup_warnings.extend(role_warnings)
     warnings.extend(followup_warnings)
     actions.extend(second_batch)
     observations.extend(followup_observations)
@@ -3825,6 +3874,7 @@ def summarize_observations_for_llm(
         summarized.append(
             {
                 "path": observation.path,
+                "role": observation.role,
                 "source_mechanism": observation.source_mechanism,
                 "confidence": observation.confidence,
                 "derived_claim": observation.derived_claim,

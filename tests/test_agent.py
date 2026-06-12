@@ -776,18 +776,20 @@ class AgentModeTests(unittest.TestCase):
     def test_render_report_includes_agent_sections(self) -> None:
         args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
         agent_run = cli.AgentRun(
-            hypotheses=[cli.AgentHypothesis(label="archive contains credentials", rationale="zip nearby")],
-            actions=[cli.AgentAction(kind="dir_list", path=".", reason="survey root")],
+            hypotheses=[cli.AgentHypothesis(label="archive contains credentials", rationale="zip nearby", role="archive_analyst")],
+            actions=[cli.AgentAction(kind="dir_list", path=".", reason="survey root", role="archive_analyst")],
             observations=[
                 cli.AgentObservation(
                     path="docs/a.txt",
                     evidence="password=secret",
                     source_mechanism="read_head",
                     confidence=0.9,
+                    role="credential_hunter",
                     derived_claim="Contains a password",
                 )
             ],
             warnings=["agent sandbox unavailable; generated helpers skipped"],
+            role_summaries=["archive analyst: archive contains credentials; next dir_list(.)"],
         )
 
         report = cli.render_report(args, Path("/tmp/case"), [], [], llm_summary=None, agent_run=agent_run)
@@ -796,26 +798,31 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("## Agent Observations", report)
         self.assertIn("## Agent Coverage and Limitations", report)
         self.assertIn("Exit status:", report)
+        self.assertIn("role=credential_hunter", report)
+        self.assertIn("subagent=archive analyst", report)
 
     def test_summarize_findings_includes_agent_stats(self) -> None:
         agent_run = cli.AgentRun(
-            hypotheses=[cli.AgentHypothesis(label="test", rationale="test", status="confirmed")],
-            actions=[cli.AgentAction(kind="read_head", path="a.txt", reason="inspect")],
+            hypotheses=[cli.AgentHypothesis(label="test", rationale="test", status="confirmed", role="credential_hunter")],
+            actions=[cli.AgentAction(kind="read_head", path="a.txt", reason="inspect", role="credential_hunter")],
             observations=[
                 cli.AgentObservation(
                     path="a.txt",
                     evidence="password=secret",
                     source_mechanism="read_head",
                     confidence=0.95,
+                    role="credential_hunter",
                     derived_claim="Contains a credential",
                 )
             ],
+            role_summaries=["credential hunter: test; next read_head(a.txt)"],
         )
 
         rendered = "\n".join(cli.summarize_findings([], [], agent_run=agent_run))
 
         self.assertIn("Agent mode", rendered)
         self.assertIn("password=secret", rendered)
+        self.assertIn("role=credential_hunter", rendered)
 
     @mock.patch("doc_triage.cli.urlopen")
     def test_request_agent_plan_repairs_non_json_response_once(self, urlopen: mock.Mock) -> None:
@@ -1163,6 +1170,7 @@ class AgentModeTests(unittest.TestCase):
                 cli.AgentAction(
                     kind="generated_python_helper",
                     reason="inspect",
+                    role="credential_hunter",
                     code="import json\nprint(json.dumps({'path':'docs/a.txt','evidence':'secret=1','confidence':0.9,'derived_claim':'Contains secret'}))\n",
                 ),
                 timeout_seconds=5,
@@ -1171,6 +1179,7 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0].source_mechanism, "generated_python_helper")
+        self.assertEqual(observations[0].role, "credential_hunter")
         self.assertIn("helper_source_hash", observations[0].metadata)
 
     def test_summarize_observations_for_llm_bounds_evidence(self) -> None:
@@ -1180,6 +1189,7 @@ class AgentModeTests(unittest.TestCase):
                 evidence="A" * 500,
                 source_mechanism="read_head",
                 confidence=0.9,
+                role="credential_hunter",
                 derived_claim="Contains a token",
             ),
             cli.AgentObservation(
@@ -1194,6 +1204,7 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertEqual(len(summarized), 1)
         self.assertEqual(summarized[0]["path"], "docs/a.txt")
+        self.assertEqual(summarized[0]["role"], "credential_hunter")
         self.assertLessEqual(len(summarized[0]["evidence"]), 80)
 
     @mock.patch("doc_triage.cli.urlopen")
@@ -1448,6 +1459,7 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("[doc-triage] [agent] Building reconnaissance context", rendered)
         self.assertIn("[doc-triage] [agent] Planning initial actions", rendered)
         self.assertIn("[doc-triage] [agent] Executing initial actions", rendered)
+        self.assertIn("[doc-triage] [agent] Executing subagent document_analyst actions", rendered)
         self.assertIn("[doc-triage] [agent] Requesting final agent summary", rendered)
 
 
