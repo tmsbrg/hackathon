@@ -90,6 +90,24 @@ class ScanLogicTests(unittest.TestCase):
         self.assertIn("pattern:credentials-assignment", detectors)
         self.assertIn("pattern:username-assignment", detectors)
 
+    def test_keyword_findings_detect_new_localized_credential_assignments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "localized.txt"
+            path.write_text(
+                "wachtwoorden: Welkom123\n"
+                "geheimnis=netzwerk2024\n"
+                "credenciales: operador-vpn\n",
+                encoding="utf-8",
+            )
+
+            findings = cli.keyword_findings(target, path, path.read_text(encoding="utf-8"))
+
+        detectors = {finding.detector for finding in findings}
+        self.assertIn("pattern:credentials-assignment", detectors)
+        self.assertIn("pattern:wachtwoord-assignment", detectors)
+        self.assertIn("pattern:german-password-assignment", detectors)
+
     def test_keyword_findings_detect_seeded_credential_field_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)

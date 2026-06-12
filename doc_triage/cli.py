@@ -4129,6 +4129,7 @@ def build_agent_coordinator_prompt(
         "subagent_roles": AGENT_ROLE_CATALOG,
         "recon": recon,
         "hypotheses": [asdict(hypothesis) for hypothesis in hypotheses[:12]],
+        "hypothesis_evidence": summarize_hypothesis_observations_for_llm(hypotheses, observations, max_items=12),
         "actions": [asdict(action) for action in actions[:12]],
         "observations": [asdict(observation) for observation in observations[:20]],
     }
@@ -4159,6 +4160,7 @@ def build_role_review_prompt(
         "role_mission": AGENT_ROLE_CATALOG.get(role, ""),
         "recon": recon,
         "hypotheses": [asdict(hypothesis) for hypothesis in hypotheses[:8]],
+        "hypothesis_evidence": summarize_hypothesis_observations_for_llm(hypotheses, observations, max_items=8),
         "actions": [asdict(action) for action in actions[:8]],
         "observations": [asdict(observation) for observation in observations[:12]],
     }

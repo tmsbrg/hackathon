@@ -471,6 +471,30 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertGreaterEqual(score, 4)
 
+    def test_build_agent_coordinator_prompt_includes_grouped_hypothesis_evidence(self) -> None:
+        hypotheses = [
+            cli.AgentHypothesis(label="VPN token reuse", rationale="Helpdesk email mentions login tokens", role="credential_hunter", status="confirmed"),
+        ]
+        actions = [
+            cli.AgentAction(kind="content_search", query="vpn", reason="inspect vpn trail", role="credential_hunter", hypothesis_label="VPN token reuse"),
+        ]
+        observations = [
+            cli.AgentObservation(
+                path="vpn.txt",
+                evidence="vpn token reset instructions",
+                source_mechanism="content_search",
+                confidence=0.9,
+                role="credential_hunter",
+                hypothesis_label="VPN token reuse",
+                derived_claim="Confirmed VPN token material",
+            )
+        ]
+
+        prompt = cli.build_agent_coordinator_prompt(Path("/tmp/case"), {"representative_heads": []}, hypotheses, actions, observations)
+
+        self.assertEqual(prompt["hypothesis_evidence"][0]["label"], "VPN token reuse")
+        self.assertEqual(prompt["hypothesis_evidence"][0]["top_observations"][0]["path"], "vpn.txt")
+
     def test_prioritize_roles_for_followup_prefers_inconclusive_hypotheses_with_strong_observations(self) -> None:
         hypotheses = [
             cli.AgentHypothesis(label="credential lead", rationale="token clue", status="inconclusive", role="credential_hunter"),
@@ -553,6 +577,8 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(second_prompt["assigned_role"], "identity_reviewer")
         self.assertEqual(first_prompt["hypotheses"][0]["role"], "credential_hunter")
         self.assertEqual(second_prompt["hypotheses"][0]["role"], "identity_reviewer")
+        self.assertEqual(first_prompt["hypothesis_evidence"], [])
+        self.assertEqual(second_prompt["hypothesis_evidence"], [])
 
     @mock.patch("doc_triage.cli.request_agent_coordination")
     def test_run_agent_mode_applies_coordinator_updates(self, request_agent_coordination: mock.Mock) -> None:
