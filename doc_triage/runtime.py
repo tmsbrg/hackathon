@@ -6,12 +6,15 @@ import signal
 import stat
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from .constants import ANSI_COLORS, ANSI_RESET
 from .models import AgentAction, CommandResult
 
 
 REGISTERED_TEMPDIRS: set[Path] = set()
+ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
+ACTIVE_CLOSEABLES: set[Any] = set()
 
 
 def verbose_log(enabled: bool, message: str) -> None:
@@ -52,35 +55,81 @@ def safe_relative_path(target: Path, relative_path: str) -> Path | None:
     return candidate
 
 
+def register_active_process(process: subprocess.Popen[str]) -> None:
+    ACTIVE_PROCESSES.add(process)
+
+
+def unregister_active_process(process: subprocess.Popen[str]) -> None:
+    ACTIVE_PROCESSES.discard(process)
+
+
+def register_closeable(resource: Any) -> None:
+    ACTIVE_CLOSEABLES.add(resource)
+
+
+def unregister_closeable(resource: Any) -> None:
+    ACTIVE_CLOSEABLES.discard(resource)
+
+
+def abort_active_work() -> None:
+    for resource in list(ACTIVE_CLOSEABLES):
+        try:
+            resource.close()
+        except OSError:
+            pass
+        finally:
+            unregister_closeable(resource)
+
+    for process in list(ACTIVE_PROCESSES):
+        try:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        finally:
+            unregister_active_process(process)
+
+
 def run_command(
     command: list[str],
     timeout: int = 30,
     cwd: Path | None = None,
     max_output_chars: int = 20000,
 ) -> CommandResult:
+    process: subprocess.Popen[str] | None = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             cwd=str(cwd) if cwd is not None else None,
-            check=False,
+            preexec_fn=os.setsid,
         )
-        stdout, stdout_truncated = truncate_output(completed.stdout, max_output_chars)
-        stderr, stderr_truncated = truncate_output(completed.stderr, max_output_chars)
+        register_active_process(process)
+        stdout_raw, stderr_raw = process.communicate(timeout=timeout)
+        stdout, stdout_truncated = truncate_output(stdout_raw, max_output_chars)
+        stderr, stderr_truncated = truncate_output(stderr_raw, max_output_chars)
         return CommandResult(
-            exit_code=completed.returncode,
+            exit_code=process.returncode or 0,
             stdout=stdout,
             stderr=stderr,
             timed_out=False,
             metadata={"stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated},
         )
     except subprocess.TimeoutExpired as exc:
-        stdout, stdout_truncated = truncate_output(exc.stdout or "", max_output_chars)
-        stderr, stderr_truncated = truncate_output(exc.stderr or "", max_output_chars)
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout_raw, stderr_raw = process.communicate()
+        else:
+            stdout_raw, stderr_raw = exc.stdout or "", exc.stderr or ""
+        stdout, stdout_truncated = truncate_output(stdout_raw, max_output_chars)
+        stderr, stderr_truncated = truncate_output(stderr_raw, max_output_chars)
         return CommandResult(
             exit_code=1,
             stdout=stdout,
@@ -96,6 +145,9 @@ def run_command(
             timed_out=False,
             metadata={"stdout_truncated": False, "stderr_truncated": False},
         )
+    finally:
+        if process is not None:
+            unregister_active_process(process)
 
 
 def tool_version(name: str) -> str:
@@ -132,10 +184,15 @@ def cleanup_tempdirs() -> None:
         unregister_tempdir(path)
 
 
+def handle_interrupt(signum: int) -> None:
+    abort_active_work()
+    cleanup_tempdirs()
+    raise SystemExit(128 + signum)
+
+
 def install_signal_handlers() -> None:
     def _handle_signal(signum: int, _frame: object) -> None:
-        cleanup_tempdirs()
-        raise SystemExit(128 + signum)
+        handle_interrupt(signum)
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)

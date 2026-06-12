@@ -68,14 +68,18 @@ from .reporting import (
 from .runtime import (
     cleanup_tempdirs,
     colorize,
+    handle_interrupt,
     install_signal_handlers,
     progress_log,
+    register_active_process,
+    register_closeable,
     register_tempdir,
     run_command,
     safe_relative_path,
     summarize_agent_action,
     tool_version,
     truncate_output,
+    unregister_closeable,
     unregister_tempdir,
     verbose_log,
     write_report,
@@ -326,8 +330,13 @@ def request_ollama_json(ollama_url: str, body: dict[str, object]) -> dict[str, o
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(request, timeout=30) as response:
+    response = urlopen(request, timeout=30)
+    register_closeable(response)
+    try:
         payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        unregister_closeable(response)
+        response.close()
     response_text = payload.get("response") or payload.get("thinking") or "{}"
     return json.loads(response_text)
 

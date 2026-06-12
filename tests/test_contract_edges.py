@@ -1,4 +1,7 @@
 import json
+import os
+import signal
+import subprocess
 import tempfile
 import unittest
 from io import StringIO
@@ -9,6 +12,38 @@ from doc_triage import cli
 
 
 class ContractEdgeTests(unittest.TestCase):
+    def test_handle_interrupt_terminates_registered_processes(self) -> None:
+        process = subprocess.Popen(
+            ["python3", "-c", "import time; time.sleep(60)"],
+            preexec_fn=os.setsid,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        cli.register_active_process(process)
+
+        with self.assertRaises(SystemExit) as exc:
+            cli.handle_interrupt(signal.SIGINT)
+
+        self.assertEqual(exc.exception.code, 130)
+        process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+        self.assertIsNotNone(process.returncode)
+
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_request_ollama_json_closes_response_on_interruptible_path(self, urlopen: mock.Mock) -> None:
+        response = mock.Mock()
+        response.read.return_value = json.dumps({"response": json.dumps({"ok": True})}).encode("utf-8")
+        urlopen.return_value = response
+
+        result = cli.request_ollama_json("http://127.0.0.1:11434", {"model": "qwen", "prompt": "hi"})
+
+        self.assertEqual(result, {"ok": True})
+        response.close.assert_called_once()
+
     def test_run_command_caps_stdout_and_marks_truncation(self) -> None:
         result = cli.run_command(["python3", "-c", "print('x' * 5000)"], max_output_chars=100)
 
