@@ -3,6 +3,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 from unittest import mock
+import json
 
 from doc_triage import cli
 
@@ -98,6 +99,37 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(any(action.kind == "content_search" for action in actions))
         self.assertTrue(any(action.path == "loot.txt" for action in actions))
 
+    def test_parse_agent_hypotheses_accepts_string_entries(self) -> None:
+        hypotheses = cli.parse_agent_hypotheses(["look for hidden archives"])
+
+        self.assertEqual(len(hypotheses), 1)
+        self.assertEqual(hypotheses[0].label, "look for hidden archives")
+
+    def test_parse_agent_actions_accepts_target_and_default_reason(self) -> None:
+        actions = cli.parse_agent_actions(
+            [{"kind": "dir_list", "target": ".", "params": ["path"]}]
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].path, ".")
+        self.assertIn("dir_list", actions[0].reason)
+
+    def test_parse_agent_actions_normalizes_root_read_head_to_dir_list(self) -> None:
+        actions = cli.parse_agent_actions([{"kind": "read_head", "target": "."}])
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "dir_list")
+
+    def test_merge_agent_actions_backfills_with_fallback(self) -> None:
+        merged = cli.merge_agent_actions(
+            [cli.AgentAction(kind="dir_list", path=".", reason="planned")],
+            [cli.AgentAction(kind="read_head", path="a.txt", reason="fallback")],
+            budget=4,
+        )
+
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[1].path, "a.txt")
+
     @mock.patch("doc_triage.cli.run_command")
     def test_execute_agent_actions_normalizes_content_search_results(self, run_command: mock.Mock) -> None:
         run_command.return_value = cli.CommandResult(
@@ -184,6 +216,93 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertIn("Agent mode", rendered)
         self.assertIn("password=secret", rendered)
+
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_plan_repairs_non_json_response_once(self, urlopen: mock.Mock) -> None:
+        first = mock.Mock()
+        first.__enter__ = mock.Mock(return_value=first)
+        first.__exit__ = mock.Mock(return_value=False)
+        first.read.return_value = json.dumps({"response": "not json"}).encode("utf-8")
+
+        second = mock.Mock()
+        second.__enter__ = mock.Mock(return_value=second)
+        second.__exit__ = mock.Mock(return_value=False)
+        second.read.return_value = json.dumps(
+            {
+                "response": json.dumps(
+                    {
+                        "hypotheses": [{"label": "H1", "rationale": "because"}],
+                        "actions": [{"kind": "read_head", "path": "a.txt", "reason": "inspect", "limit": 5}],
+                    }
+                )
+            }
+        ).encode("utf-8")
+        urlopen.side_effect = [first, second]
+
+        hypotheses, actions = cli.request_agent_plan(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            {"instructions": ["Return hypotheses and actions"]},
+        )
+
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(len(hypotheses), 1)
+        self.assertEqual(len(actions), 1)
+
+    @mock.patch("doc_triage.cli.run_command")
+    @mock.patch("doc_triage.cli.shutil.which", return_value="/usr/bin/bwrap")
+    def test_execute_generated_helper_parses_observations(self, _: mock.Mock, run_command: mock.Mock) -> None:
+        run_command.return_value = cli.CommandResult(
+            exit_code=0,
+            stdout='{"path":"docs/a.txt","evidence":"secret=1","confidence":0.9,"derived_claim":"Contains secret"}\n',
+            stderr="",
+            timed_out=False,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            observations, warnings = cli.execute_generated_helper(
+                Path(tmpdir),
+                cli.AgentAction(
+                    kind="generated_python_helper",
+                    reason="inspect",
+                    code="import json\nprint(json.dumps({'path':'docs/a.txt','evidence':'secret=1','confidence':0.9,'derived_claim':'Contains secret'}))\n",
+                ),
+                timeout_seconds=5,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source_mechanism, "generated_python_helper")
+
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    @mock.patch("doc_triage.cli.execute_agent_actions")
+    def test_run_agent_mode_deduplicates_refined_actions(
+        self,
+        execute_agent_actions: mock.Mock,
+        request_agent_plan: mock.Mock,
+    ) -> None:
+        request_agent_plan.side_effect = [
+            (
+                [cli.AgentHypothesis(label="h1", rationale="r1")],
+                [cli.AgentAction(kind="read_head", path="a.txt", reason="inspect")],
+            ),
+            (
+                [cli.AgentHypothesis(label="h1", rationale="r1", status="confirmed")],
+                [
+                    cli.AgentAction(kind="read_head", path="a.txt", reason="inspect again"),
+                    cli.AgentAction(kind="dir_list", path="docs", reason="survey"),
+                ],
+            ),
+        ]
+        execute_agent_actions.side_effect = [
+            ([cli.AgentObservation(path="a.txt", evidence="one", source_mechanism="read_head", confidence=0.8)], []),
+            ([cli.AgentObservation(path="docs", evidence="b.txt", source_mechanism="dir_list", confidence=0.6)], []),
+        ]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run = cli.run_agent_mode(Path(tmpdir), [], args)
+
+        self.assertEqual(len(run.actions), 2)
+        self.assertEqual(run.actions[1].kind, "dir_list")
 
 
 if __name__ == "__main__":

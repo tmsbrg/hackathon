@@ -952,6 +952,11 @@ def parse_agent_hypotheses(payload: object) -> list[AgentHypothesis]:
         return []
     hypotheses: list[AgentHypothesis] = []
     for item in payload[:8]:
+        if isinstance(item, str):
+            label = item.strip()
+            if label:
+                hypotheses.append(AgentHypothesis(label=label, rationale="LLM-proposed hypothesis."))
+            continue
         if not isinstance(item, dict):
             continue
         label = str(item.get("label") or item.get("hypothesis") or "").strip()
@@ -980,14 +985,27 @@ def parse_agent_actions(payload: object) -> list[AgentAction]:
         if not isinstance(item, dict):
             continue
         kind = str(item.get("kind") or "").strip()
-        reason = str(item.get("reason") or "").strip()
-        path = str(item.get("path") or ".").strip() or "."
+        path = str(item.get("path") or item.get("target") or ".").strip() or "."
         query = str(item.get("query") or "").strip()
         code = str(item.get("code") or "").strip()
+        reason = str(item.get("reason") or item.get("why") or item.get("description") or "").strip()
         limit = item.get("limit", 20)
         if not isinstance(limit, int):
             limit = 20
-        if not kind or not reason:
+        if not kind:
+            continue
+        if kind in {"content_search", "filename_search"} and not query:
+            query = str(item.get("pattern") or item.get("regex") or "").strip()
+        if not reason:
+            target_label = query or path
+            reason = f"Investigate {target_label} via {kind}."
+        if kind == "read_head" and path in {".", "/input"}:
+            kind = "dir_list"
+        if kind == "strings_head" and path in {".", "/input"}:
+            kind = "dir_list"
+        if kind == "content_search" and not query and path not in {"", ".", "/input"}:
+            kind = "read_head"
+        if kind in {"content_search", "filename_search"} and not query:
             continue
         actions.append(
             AgentAction(
@@ -1083,6 +1101,20 @@ def build_fallback_agent_plan(
                     break
     deduped = deduplicate_agent_actions(actions)[:action_budget]
     return hypotheses, deduped
+
+
+def merge_agent_actions(primary: list[AgentAction], fallback: list[AgentAction], budget: int) -> list[AgentAction]:
+    merged: list[AgentAction] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for action in [*primary, *fallback]:
+        key = (action.kind, action.path, action.query, action.code)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(action)
+        if len(merged) >= budget:
+            break
+    return merged
 
 
 def normalize_agent_observation(
@@ -1522,19 +1554,52 @@ def request_agent_plan(
     model: str,
     prompt: dict[str, object],
 ) -> tuple[list[AgentHypothesis], list[AgentAction]]:
-    parsed = request_ollama_json(
-        ollama_url,
-        {
-            "model": model,
-            "stream": False,
-            "think": False,
-            "format": "json",
-            "prompt": json.dumps(prompt),
-        },
-    )
+    request_body = {
+        "model": model,
+        "stream": False,
+        "think": False,
+        "format": "json",
+        "prompt": json.dumps(prompt),
+    }
+    parsed: dict[str, object] | None = None
+    first_error: Exception | None = None
+    try:
+        response = request_ollama_json(ollama_url, request_body)
+        if isinstance(response, dict):
+            parsed = response
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        first_error = exc
+    except Exception as exc:
+        first_error = exc
+
+    required_keys = {"hypotheses", "actions"}
+    if parsed is None or not required_keys.issubset(parsed):
+        repaired = request_ollama_json(
+            ollama_url,
+            {
+                "model": model,
+                "stream": False,
+                "think": False,
+                "format": "json",
+                "prompt": (
+                    "Repair the previous answer into strict JSON with keys hypotheses and actions. "
+                    "Actions must only use supported kinds.\n"
+                    + json.dumps({"previous_response": parsed, "original_prompt": prompt, "error": str(first_error)})
+                ),
+            },
+        )
+        if isinstance(repaired, dict):
+            parsed = repaired
+
     if not isinstance(parsed, dict):
         return [], []
-    return parse_agent_hypotheses(parsed.get("hypotheses")), parse_agent_actions(parsed.get("actions"))
+    hypotheses = parse_agent_hypotheses(parsed.get("hypotheses"))
+    actions = [
+        action
+        for action in parse_agent_actions(parsed.get("actions"))
+        if action.kind in AGENT_ACTION_KINDS
+    ]
+    return hypotheses, actions
 
 
 def run_agent_mode(
@@ -1577,11 +1642,8 @@ def run_agent_mode(
     fallback_hypotheses, fallback_actions = build_fallback_agent_plan(target, findings, recon, args.agent_max_actions)
     if not hypotheses:
         hypotheses = fallback_hypotheses
-    actions = deduplicate_agent_actions(planned_actions)
-    if not actions:
-        warnings.append("agent planner returned no executable actions; using fallback action set")
-        actions = fallback_actions
-    actions = actions[: args.agent_max_actions]
+    planned_actions = deduplicate_agent_actions(planned_actions)
+    actions = merge_agent_actions(planned_actions, fallback_actions, args.agent_max_actions)
     observations, action_warnings = execute_agent_actions(target, actions, args.agent_timeout)
     warnings.extend(action_warnings)
 
