@@ -749,6 +749,47 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(summary["executive_summary"], "fixed")
 
     @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_summary_repair_includes_raw_previous_response_text(self, urlopen: mock.Mock) -> None:
+        calls: list[object] = []
+
+        def _side_effect(request: object, timeout: int | None = None) -> mock.Mock:
+            calls.append(request)
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock(return_value=False)
+            if len(calls) == 1:
+                response.read.return_value = json.dumps({"response": "{"}).encode("utf-8")
+            else:
+                payload = json.loads(request.data.decode("utf-8"))
+                repair_prompt = payload["prompt"]
+                self.assertIn('"previous_response": "{"', repair_prompt)
+                self.assertIn('"previous_response_text": "{"', repair_prompt)
+                response.read.return_value = json.dumps(
+                    {
+                        "response": json.dumps(
+                            {
+                                "executive_summary": "fixed",
+                                "priority_findings": [],
+                                "relationships": [],
+                                "review_order": [],
+                            }
+                        )
+                    }
+                ).encode("utf-8")
+            return response
+
+        urlopen.side_effect = _side_effect
+
+        summary = cli.request_agent_summary(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            {"instructions": ["Return executive_summary, priority_findings, relationships, review_order"]},
+        )
+
+        self.assertEqual(summary["executive_summary"], "fixed")
+        self.assertEqual(len(calls), 2)
+
+    @mock.patch("doc_triage.cli.urlopen")
     def test_request_agent_summary_uses_configured_retry_budget(self, urlopen: mock.Mock) -> None:
         first = mock.Mock()
         first.__enter__ = mock.Mock(return_value=first)

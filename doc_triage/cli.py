@@ -454,6 +454,7 @@ def request_structured_json(
     last_error: Exception | None = None
     prior_response: dict[str, object] | None = None
     last_response_text = ""
+    prior_response_text = ""
 
     for attempt in range(max_retries + 1):
         if attempt == 0:
@@ -477,7 +478,9 @@ def request_structured_json(
                     + "\n"
                     + json.dumps(
                         {
-                            "previous_response": prior_response,
+                            "previous_response": prior_response_text or prior_response,
+                            "previous_response_text": prior_response_text,
+                            "previous_response_json": prior_response,
                             "original_prompt": prompt,
                             "error": str(last_error) if last_error else "",
                             "attempt": attempt,
@@ -487,6 +490,7 @@ def request_structured_json(
             }
         try:
             last_response_text = request_ollama_text(ollama_url, request_body, timeout_seconds=timeout_seconds)
+            prior_response_text = last_response_text
             response = parse_llm_json_text(last_response_text)
             prior_response = response if isinstance(response, dict) else {"value": response}
             if isinstance(response, dict) and required_keys.issubset(response):
