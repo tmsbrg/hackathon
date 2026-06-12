@@ -144,7 +144,7 @@ class IntegrationTests(unittest.TestCase):
                 self.assertTrue(captured_path.exists())
                 self.assertEqual(
                     captured_path.read_text(encoding="utf-8"),
-                    "(?s:.*/ANSWER\\.txt)\n(?s:.*/HINT\\.txt)\n",
+                    ".*/ANSWER\\.txt\n.*/HINT\\.txt\n",
                 )
                 return cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
             raise AssertionError(f"Unexpected command: {command}")
@@ -196,6 +196,16 @@ class IntegrationTests(unittest.TestCase):
 
         self.assertIn("sequence/ctf/sequence.txt", rendered)
         self.assertIn("Legacy Cloudflare cookie", rendered)
+
+    def test_render_relationship_skips_empty_label_only_entries(self) -> None:
+        rendered = cli.render_relationship({"type": "header_type"})
+
+        self.assertEqual(rendered, [])
+
+    def test_render_priority_item_skips_empty_reason_entries(self) -> None:
+        rendered = cli.render_priority_item({"source_path": "sequence/ctf/sequence.txt"})
+
+        self.assertEqual(rendered, "")
 
     @mock.patch("doc_triage.cli.urlopen")
     def test_ollama_summary_parses_json_response(self, urlopen: mock.Mock) -> None:

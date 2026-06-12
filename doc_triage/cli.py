@@ -486,8 +486,15 @@ def should_exclude(target: Path, file_path: Path, exclude_globs: Sequence[str]) 
 
 
 def glob_to_regex(pattern: str) -> str:
-    translated = fnmatch.translate(pattern)
-    return translated.removesuffix(r"\Z").removesuffix(r"\z")
+    escaped: list[str] = []
+    for char in pattern:
+        if char == "*":
+            escaped.append(".*")
+        elif char == "?":
+            escaped.append(".")
+        else:
+            escaped.append(re.escape(char))
+    return "".join(escaped)
 
 
 def rga_exclude_globs(pattern: str) -> list[str]:
@@ -866,7 +873,9 @@ def render_report(
     if llm_summary and llm_summary.get("priority_findings"):
         lines.extend(["", "## LLM Priority Findings"])
         for item in llm_summary["priority_findings"]:
-            lines.append(render_priority_item(item))
+            rendered_item = render_priority_item(item)
+            if rendered_item:
+                lines.append(rendered_item)
 
     lines.extend(["", "## Files Recommended for Manual Review"])
     review_order = llm_summary.get("review_order") if llm_summary else None
@@ -890,6 +899,8 @@ def render_relationship(item: object) -> list[str]:
         sources = item.get("source_paths")
         if not sources and item.get("source_path"):
             sources = [item.get("source_path")]
+        if not description and not sources:
+            return []
         lines = [f"- {relation_type}: {description}".rstrip()]
         if isinstance(sources, list) and sources:
             lines.append(f"  Sources: {', '.join(str(source) for source in sources)}")
@@ -941,6 +952,8 @@ def render_priority_item(item: object) -> str:
             or item.get("supporting_evidence")
             or "<reason missing>"
         )
+        if reason == "<reason missing>":
+            return ""
         return f"- {source}: {reason}".rstrip()
     return f"- {item}"
 
