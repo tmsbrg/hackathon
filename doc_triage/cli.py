@@ -205,6 +205,166 @@ def group_actions_by_role(actions: Sequence["AgentAction"]) -> list[tuple[str, l
     return [(role, grouped[role]) for role in order]
 
 
+def infer_observation_handoff_targets(observation: AgentObservation) -> list[tuple[str, str]]:
+    combined = " ".join(
+        part for part in (observation.path, observation.evidence, observation.derived_claim, observation.source_mechanism) if part
+    ).lower()
+    source_role = observation.role.strip() or infer_agent_role(observation.derived_claim, source=observation.path)
+    targets: list[tuple[str, str]] = []
+    if source_role != "credential_hunter" and any(token in combined for token in ("password", "passwd", "token", "secret", "cookie", "login", "credential", "welkom123")):
+        targets.append(("credential_hunter", "Observation suggests authentication material worth credential-focused follow-up."))
+    if source_role != "identity_reviewer" and any(token in combined for token in ("employee", "payroll", "salary", "hr", "bsn", "iban", "citizen", "personnel")):
+        targets.append(("identity_reviewer", "Observation suggests personal or financial records worth identity-focused review."))
+    if source_role != "infra_config_reviewer" and any(token in combined for token in ("config", "json", "yaml", "xml", "docker", "kube", "terraform", "service", "hostname", "endpoint")):
+        targets.append(("infra_config_reviewer", "Observation suggests service or configuration exposure worth infrastructure review."))
+    if source_role != "archive_analyst" and any(token in combined for token in ("zip", "archive", "backup", "attachment", ".tar", ".7z")):
+        targets.append(("archive_analyst", "Observation suggests packaged artifacts worth archive-focused inspection."))
+    if source_role != "document_analyst" and observation.source_mechanism in {"filename_search", "file_info", "zip_list"}:
+        targets.append(("document_analyst", "Observation suggests a document deserves direct content review."))
+    deduped: list[tuple[str, str]] = []
+    seen_roles: set[str] = set()
+    for role, reason in targets:
+        if role in seen_roles:
+            continue
+        seen_roles.add(role)
+        deduped.append((role, reason))
+    return deduped
+
+
+def _handoff_action_for_observation(
+    target: Path,
+    observation: AgentObservation,
+    target_role: str,
+    reason: str,
+) -> AgentAction | None:
+    source_path = observation.path.strip()
+    resolved = resolve_agent_action_path(target, source_path) if source_path else None
+    if target_role == "credential_hunter":
+        for candidate in ("password", "token", "secret", "cookie", "login", "credential"):
+            if candidate in observation.evidence.lower() or candidate in observation.derived_claim.lower():
+                return AgentAction(
+                    kind="content_search",
+                    query=candidate,
+                    reason=f"{reason} Handoff from {observation.role or 'another subagent'} based on {observation.path}.",
+                    role=target_role,
+                    limit=10,
+                )
+        if resolved is not None and resolved.is_file():
+            return AgentAction(
+                kind="read_head",
+                path=source_path,
+                reason=f"{reason} Review the source document directly for credential context.",
+                role=target_role,
+                limit=20,
+            )
+    if target_role == "identity_reviewer":
+        if resolved is not None and resolved.is_file():
+            return AgentAction(
+                kind="read_head",
+                path=source_path,
+                reason=f"{reason} Review the flagged artifact for identity-bearing fields.",
+                role=target_role,
+                limit=20,
+            )
+        if resolved is not None and resolved.parent != target:
+            return AgentAction(
+                kind="dir_list",
+                path=relative_source(target, resolved.parent),
+                reason=f"{reason} Inspect nearby records for related personal or financial material.",
+                role=target_role,
+                limit=20,
+            )
+    if target_role == "infra_config_reviewer":
+        if resolved is not None and resolved.is_file():
+            target_kind = classify_agent_target(resolved)
+            action_kind = "read_head" if target_kind == "text" else "file_info"
+            return AgentAction(
+                kind=action_kind,
+                path=source_path,
+                reason=f"{reason} Inspect the likely configuration artifact directly.",
+                role=target_role,
+                limit=20,
+            )
+        return AgentAction(
+            kind="content_search",
+            query="config|service|endpoint|host|docker|kube|terraform",
+            reason=f"{reason} Search for adjacent infrastructure markers.",
+            role=target_role,
+            limit=10,
+        )
+    if target_role == "archive_analyst":
+        if resolved is not None and classify_agent_target(resolved) == "archive":
+            return AgentAction(
+                kind="zip_list",
+                path=source_path,
+                reason=f"{reason} Inspect the packaged artifact directly.",
+                role=target_role,
+                limit=20,
+            )
+        if resolved is not None:
+            return AgentAction(
+                kind="dir_list",
+                path=relative_source(target, resolved.parent if resolved.is_file() else resolved),
+                reason=f"{reason} Survey nearby packaged artifacts.",
+                role=target_role,
+                limit=20,
+            )
+    if target_role == "document_analyst" and resolved is not None and resolved.is_file():
+        return AgentAction(
+            kind="read_head",
+            path=source_path,
+            reason=f"{reason} Read the artifact directly to understand document context.",
+            role=target_role,
+            limit=20,
+        )
+    return None
+
+
+def build_cross_role_handoff_plan(
+    target: Path,
+    observations: Sequence[AgentObservation],
+    existing_actions: Sequence[AgentAction],
+    action_budget: int,
+) -> tuple[list[AgentHypothesis], list[AgentAction], list[str]]:
+    hypotheses: list[AgentHypothesis] = []
+    actions: list[AgentAction] = []
+    notes: list[str] = []
+    existing_keys = {
+        (action.kind, action.path, action.query, hashlib.sha256(action.code.encode("utf-8")).hexdigest())
+        for action in existing_actions
+    }
+    hypothesis_keys = {(item.role, item.label, item.rationale) for item in hypotheses}
+    for observation in observations:
+        if len(actions) >= action_budget:
+            break
+        source_role = observation.role.strip() or infer_agent_role(observation.derived_claim, source=observation.path)
+        for target_role, reason in infer_observation_handoff_targets(observation):
+            if len(actions) >= action_budget:
+                break
+            hypothesis = AgentHypothesis(
+                label=f"Handoff from {source_role} for {observation.path}",
+                rationale=reason,
+                status="inconclusive",
+                role=target_role,
+                evidence_paths=[observation.path],
+                notes=f"Spawned from observation by {source_role}.",
+            )
+            hypothesis_key = (hypothesis.role, hypothesis.label, hypothesis.rationale)
+            if hypothesis_key not in hypothesis_keys:
+                hypothesis_keys.add(hypothesis_key)
+                hypotheses.append(hypothesis)
+            action = _handoff_action_for_observation(target, observation, target_role, reason)
+            if action is None:
+                continue
+            action_key = (action.kind, action.path, action.query, hashlib.sha256(action.code.encode("utf-8")).hexdigest())
+            if action_key in existing_keys:
+                continue
+            existing_keys.add(action_key)
+            actions.append(action)
+            notes.append(f"{source_role} -> {target_role} via {observation.path}")
+    return hypotheses, deduplicate_agent_actions(actions)[:action_budget], notes[:action_budget]
+
+
 def render_agent_plan_records(hypotheses: Sequence["AgentHypothesis"], actions: Sequence["AgentAction"]) -> str:
     records: list[str] = []
     for hypothesis in hypotheses:
@@ -3612,6 +3772,27 @@ def run_agent_mode(
         f"Initial actions produced {len(observations)} observations and {len(action_warnings)} warnings",
     )
 
+    handoff_budget = max(0, args.agent_max_actions - len(actions))
+    handoff_hypotheses: list[AgentHypothesis] = []
+    handoff_actions: list[AgentAction] = []
+    handoff_notes: list[str] = []
+    if handoff_budget > 0 and observations:
+        handoff_hypotheses, handoff_actions, handoff_notes = build_cross_role_handoff_plan(
+            target,
+            observations,
+            actions,
+            handoff_budget,
+        )
+        if handoff_actions:
+            hypotheses = [*hypotheses, *handoff_hypotheses]
+            progress_log(
+                args.verbose,
+                "agent",
+                "Cross-subagent handoffs: " + "; ".join(handoff_notes[:4]),
+            )
+            for summary in build_role_plan_summary(handoff_hypotheses, handoff_actions):
+                progress_log(args.verbose, "agent", f"Handoff subagent plan: {summary}")
+
     try:
         progress_log(args.verbose, "agent", "Requesting refined action plan")
         refined_hypotheses, refined_actions = request_agent_plan(
@@ -3620,9 +3801,9 @@ def run_agent_mode(
             build_agent_refinement_prompt(
                 target,
                 recon,
-                actions,
+                [*actions, *handoff_actions],
                 observations,
-                max(0, args.agent_max_actions - len(actions)),
+                max(0, args.agent_max_actions - len(actions) - len(handoff_actions)),
             ),
             model_retries=args.model_retries,
             timeout_seconds=args.ollama_timeout,
@@ -3645,8 +3826,17 @@ def run_agent_mode(
             progress_log(args.verbose, "agent", f"Refined subagent plan: {summary}")
     remaining_budget = max(0, args.agent_max_actions - len(actions))
     second_batch = []
+    existing = {(item.kind, item.path, item.query, item.code) for item in actions}
+    for action in deduplicate_agent_actions(handoff_actions):
+        key = (action.kind, action.path, action.query, action.code)
+        if key in existing:
+            continue
+        existing.add(key)
+        second_batch.append(action)
+        if len(second_batch) >= remaining_budget:
+            break
+    remaining_budget = max(0, remaining_budget - len(second_batch))
     if remaining_budget > 0:
-        existing = {(item.kind, item.path, item.query, item.code) for item in actions}
         for action in deduplicate_agent_actions(refined_actions):
             key = (action.kind, action.path, action.query, action.code)
             if key in existing:

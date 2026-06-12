@@ -312,6 +312,31 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(request_agent_plan.call_count, 2)
         self.assertEqual({action.role for action in actions}, {"credential_hunter", "identity_reviewer"})
 
+    def test_build_cross_role_handoff_plan_spawns_followup_role_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "docs" / "notes.txt"
+            path.parent.mkdir(parents=True)
+            path.write_text("temporary password: Welkom123\n", encoding="utf-8")
+            observations = [
+                cli.AgentObservation(
+                    path="docs/notes.txt",
+                    evidence="temporary password: Welkom123",
+                    source_mechanism="read_head",
+                    confidence=0.9,
+                    role="document_analyst",
+                    derived_claim="Found likely login material",
+                )
+            ]
+
+            hypotheses, actions, notes = cli.build_cross_role_handoff_plan(target, observations, [], 4)
+
+        self.assertTrue(hypotheses)
+        self.assertTrue(any(item.role == "credential_hunter" for item in hypotheses))
+        self.assertTrue(any(action.role == "credential_hunter" for action in actions))
+        self.assertTrue(any(action.kind == "content_search" for action in actions))
+        self.assertTrue(any("document_analyst -> credential_hunter" in note for note in notes))
+
     def test_parse_agent_actions_normalizes_zip_list_directory_target(self) -> None:
         actions = cli.parse_agent_actions(
             [{"kind": "zip_list", "path": "ctf_cases/bad_blockchain", "reason": "inspect archive-like target"}]
@@ -1461,6 +1486,67 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("[doc-triage] [agent] Executing initial actions", rendered)
         self.assertIn("[doc-triage] [agent] Executing subagent document_analyst actions", rendered)
         self.assertIn("[doc-triage] [agent] Requesting final agent summary", rendered)
+
+    @mock.patch("doc_triage.cli.request_agent_summary", return_value={"executive_summary": "done", "priority_findings": [], "relationships": [], "review_order": []})
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    @mock.patch("doc_triage.cli.execute_agent_actions")
+    def test_run_agent_mode_uses_cross_role_handoff_actions(
+        self,
+        execute_agent_actions: mock.Mock,
+        request_agent_plan: mock.Mock,
+        _: mock.Mock,
+    ) -> None:
+        request_agent_plan.side_effect = [
+            (
+                [cli.AgentHypothesis(label="review docs", rationale="start with document", role="document_analyst")],
+                [cli.AgentAction(kind="read_head", path="docs/a.txt", reason="inspect document", role="document_analyst")],
+            ),
+            (
+                [cli.AgentHypothesis(label="review docs", rationale="start with document", status="confirmed", role="document_analyst")],
+                [],
+            ),
+        ]
+        execute_agent_actions.side_effect = [
+            (
+                [
+                    cli.AgentObservation(
+                        path="docs/a.txt",
+                        evidence="temporary password: Welkom123",
+                        source_mechanism="read_head",
+                        confidence=0.9,
+                        role="document_analyst",
+                        derived_claim="Found likely login material",
+                    )
+                ],
+                [],
+            ),
+            (
+                [
+                    cli.AgentObservation(
+                        path="docs/a.txt",
+                        evidence="temporary password: Welkom123",
+                        source_mechanism="content_search",
+                        confidence=0.8,
+                        role="credential_hunter",
+                        derived_claim="Credential hunter confirmed login material",
+                    )
+                ],
+                [],
+            ),
+        ]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / "docs").mkdir()
+            (target / "docs" / "a.txt").write_text("temporary password: Welkom123\n", encoding="utf-8")
+
+            run = cli.run_agent_mode(target, [], args)
+
+        self.assertGreaterEqual(execute_agent_actions.call_count, 2)
+        followup_actions = execute_agent_actions.call_args_list[1].args[1]
+        self.assertTrue(any(action.role == "credential_hunter" for action in followup_actions))
+        self.assertTrue(any("Handoff from document_analyst" in (action.reason or "") for action in followup_actions))
+        self.assertTrue(any(observation.role == "credential_hunter" for observation in run.observations))
 
 
 if __name__ == "__main__":
