@@ -4,6 +4,7 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 import json
+import contextlib
 
 from doc_triage import cli
 
@@ -445,6 +446,40 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertTrue(run.actions)
         self.assertTrue(any("agent planning failed:" in warning for warning in run.warnings))
+
+    @mock.patch("doc_triage.cli.request_agent_summary", return_value={"executive_summary": "done", "priority_findings": [], "relationships": [], "review_order": []})
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    @mock.patch("doc_triage.cli.execute_agent_actions")
+    def test_run_agent_mode_verbose_prints_stage_progress(
+        self,
+        execute_agent_actions: mock.Mock,
+        request_agent_plan: mock.Mock,
+        _: mock.Mock,
+    ) -> None:
+        request_agent_plan.side_effect = [
+            (
+                [cli.AgentHypothesis(label="h1", rationale="r1")],
+                [cli.AgentAction(kind="read_head", path="a.txt", reason="inspect")],
+            ),
+            (
+                [cli.AgentHypothesis(label="h1", rationale="r1", status="confirmed")],
+                [],
+            ),
+        ]
+        execute_agent_actions.side_effect = [
+            ([cli.AgentObservation(path="a.txt", evidence="one", source_mechanism="read_head", confidence=0.8)], []),
+            ([], []),
+        ]
+        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--agent"])
+        stdout = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stdout(stdout):
+            cli.run_agent_mode(Path(tmpdir), [], args)
+
+        rendered = stdout.getvalue()
+        self.assertIn("[doc-triage] [agent] Building reconnaissance context", rendered)
+        self.assertIn("[doc-triage] [agent] Planning initial actions", rendered)
+        self.assertIn("[doc-triage] [agent] Executing initial actions", rendered)
+        self.assertIn("[doc-triage] [agent] Requesting final agent summary", rendered)
 
 
 if __name__ == "__main__":

@@ -231,6 +231,16 @@ def verbose_log(enabled: bool, message: str) -> None:
         print(f"[doc-triage] {message}")
 
 
+def progress_log(enabled: bool, stage: str, message: str) -> None:
+    if enabled:
+        print(f"[doc-triage] [{stage}] {message}")
+
+
+def summarize_agent_action(action: AgentAction) -> str:
+    target = action.query or action.path
+    return f"{action.kind}({target})"
+
+
 def run_doctor() -> int:
     statuses = detect_tools()
     missing_required = [tool.name for tool in statuses if tool.required and not tool.path]
@@ -641,11 +651,16 @@ def scan_target(
         warnings.append(f"File limit reached at {max_files} files.")
         files = files[:max_files]
 
-    verbose_log(verbose, f"Scanning {len(files)} files under {target}")
-    external_findings, external_warnings = run_external_scanners(target, exclude_globs=exclude_globs)
+    progress_log(verbose, "inventory", f"Prepared {len(files)} files under {target}")
+    progress_log(verbose, "scanners", "Running external scanners (rg, rga, trufflehog)")
+    external_findings, external_warnings = run_external_scanners(target, exclude_globs=exclude_globs, verbose=verbose)
     findings.extend(external_findings)
     warnings.extend(external_warnings)
-    verbose_log(verbose, f"External scanners produced {len(external_findings)} findings and {len(external_warnings)} warnings")
+    progress_log(
+        verbose,
+        "scanners",
+        f"External scanners produced {len(external_findings)} findings and {len(external_warnings)} warnings",
+    )
 
     for file_path in files:
         file_count += 1
@@ -664,7 +679,7 @@ def scan_target(
         findings.extend(keyword_findings(target, file_path, content))
 
     if ocr:
-        verbose_log(verbose, "OCR enabled; processing supported image and PDF files")
+        progress_log(verbose, "ocr", "OCR enabled; processing supported image and PDF files")
         with tempfile.TemporaryDirectory(prefix="doc-triage-ocr-") as temp_dir:
             temp_path = Path(temp_dir)
             register_tempdir(temp_path)
@@ -672,16 +687,21 @@ def scan_target(
             unregister_tempdir(temp_path)
         findings.extend(ocr_findings)
         warnings.extend(ocr_warnings)
-        verbose_log(verbose, f"OCR produced {len(ocr_findings)} findings and {len(ocr_warnings)} warnings")
+        progress_log(verbose, "ocr", f"OCR produced {len(ocr_findings)} findings and {len(ocr_warnings)} warnings")
 
     return deduplicate_findings(findings), warnings
 
 
-def run_external_scanners(target: Path, exclude_globs: Sequence[str] | None = None) -> tuple[list[Finding], list[str]]:
+def run_external_scanners(
+    target: Path,
+    exclude_globs: Sequence[str] | None = None,
+    verbose: bool = False,
+) -> tuple[list[Finding], list[str]]:
     warnings: list[str] = []
     findings: list[Finding] = []
     exclude_globs = list(exclude_globs or [])
 
+    progress_log(verbose, "rg", "Enumerating files with rg --files")
     rg_result = run_command(["rg", "--files", str(target)])
     if rg_result.timed_out:
         warnings.append("rg --files timed out.")
@@ -693,6 +713,7 @@ def run_external_scanners(target: Path, exclude_globs: Sequence[str] | None = No
         for expanded in rga_exclude_globs(pattern):
             rga_command.extend(["-g", f"!{expanded}"])
     rga_command.extend([".", str(target)])
+    progress_log(verbose, "rga", "Searching content with ripgrep-all")
     rga_result = run_command(rga_command)
     if rga_result.timed_out:
         warnings.append("rga timed out.")
@@ -714,6 +735,7 @@ def run_external_scanners(target: Path, exclude_globs: Sequence[str] | None = No
         finally:
             exclude_file.close()
         trufflehog_command.extend(["--exclude-paths", exclude_file.name])
+    progress_log(verbose, "trufflehog", "Scanning filesystem secrets with trufflehog")
     trufflehog_result = run_command(trufflehog_command)
     if exclude_file is not None:
         Path(exclude_file.name).unlink(missing_ok=True)
@@ -1749,10 +1771,12 @@ def run_agent_mode(
     args: argparse.Namespace,
     exclude_globs: Sequence[str] | None = None,
 ) -> AgentRun:
+    progress_log(args.verbose, "agent", "Building reconnaissance context")
     recon = build_agent_recon_context(target, findings, args.max_llm_files, exclude_globs=exclude_globs)
     warnings: list[str] = []
     fallback_hypotheses, fallback_actions = build_fallback_agent_plan(target, findings, recon, args.agent_max_actions)
     try:
+        progress_log(args.verbose, "agent", f"Planning initial actions with model {args.model}")
         hypotheses, planned_actions = request_agent_plan(
             args.ollama_url,
             args.model,
@@ -1761,15 +1785,27 @@ def run_agent_mode(
     except Exception as exc:
         warnings.append(f"agent planning failed: {exc}")
         hypotheses, planned_actions = fallback_hypotheses, fallback_actions
+        progress_log(args.verbose, "agent", f"Initial planning failed; using fallback actions ({exc})")
 
     if not hypotheses:
         hypotheses = fallback_hypotheses
     planned_actions = deduplicate_agent_actions(planned_actions)
     actions = merge_agent_actions(planned_actions, fallback_actions, args.agent_max_actions)
+    progress_log(
+        args.verbose,
+        "agent",
+        f"Executing initial actions ({len(actions)}): {', '.join(summarize_agent_action(action) for action in actions[:6])}",
+    )
     observations, action_warnings = execute_agent_actions(target, actions, args.agent_timeout)
     warnings.extend(action_warnings)
+    progress_log(
+        args.verbose,
+        "agent",
+        f"Initial actions produced {len(observations)} observations and {len(action_warnings)} warnings",
+    )
 
     try:
+        progress_log(args.verbose, "agent", "Requesting refined action plan")
         refined_hypotheses, refined_actions = request_agent_plan(
             args.ollama_url,
             args.model,
@@ -1784,6 +1820,7 @@ def run_agent_mode(
     except Exception as exc:
         refined_hypotheses, refined_actions = hypotheses, []
         warnings.append(f"agent refinement failed: {exc}")
+        progress_log(args.verbose, "agent", f"Refinement failed; continuing without follow-up plan ({exc})")
 
     all_hypotheses = hypotheses or refined_hypotheses or fallback_hypotheses
     remaining_budget = max(0, args.agent_max_actions - len(actions))
@@ -1797,10 +1834,22 @@ def run_agent_mode(
             second_batch.append(action)
             if len(second_batch) >= remaining_budget:
                 break
+    if second_batch:
+        progress_log(
+            args.verbose,
+            "agent",
+            f"Executing follow-up actions ({len(second_batch)}): {', '.join(summarize_agent_action(action) for action in second_batch[:6])}",
+        )
     followup_observations, followup_warnings = execute_agent_actions(target, second_batch, args.agent_timeout)
     warnings.extend(followup_warnings)
     actions.extend(second_batch)
     observations.extend(followup_observations)
+    if second_batch:
+        progress_log(
+            args.verbose,
+            "agent",
+            f"Follow-up actions produced {len(followup_observations)} observations and {len(followup_warnings)} warnings",
+        )
 
     llm_summary_prompt = {
         "instructions": [
@@ -1822,14 +1871,18 @@ def run_agent_mode(
     }
     llm_summary: dict[str, object] | None = None
     try:
+        progress_log(args.verbose, "agent", "Requesting final agent summary")
         llm_summary = request_agent_summary(args.ollama_url, args.model, llm_summary_prompt)
     except RuntimeError as exc:
         warnings.append(f"agent summary failed: {exc}")
+        progress_log(args.verbose, "agent", f"Final summary failed ({exc})")
     except Exception as exc:
         warnings.append(f"agent summary failed: {exc}")
+        progress_log(args.verbose, "agent", f"Final summary failed ({exc})")
 
     if llm_summary is not None and isinstance(llm_summary, dict):
         llm_summary = normalize_llm_summary(llm_summary)
+        progress_log(args.verbose, "agent", "Final agent summary completed")
     else:
         llm_summary = None
 
@@ -2156,10 +2209,10 @@ def run_scan(args: argparse.Namespace) -> int:
     if output_path.is_relative_to(target):
         exclude_globs.append(relative_source(target, output_path))
 
-    verbose_log(args.verbose, f"Starting scan for {target}")
-    verbose_log(args.verbose, f"Writing report to {output_path}")
+    progress_log(args.verbose, "scan", f"Starting scan for {target}")
+    progress_log(args.verbose, "scan", f"Writing report to {output_path}")
     if exclude_globs:
-        verbose_log(args.verbose, f"Using exclude globs: {exclude_globs}")
+        progress_log(args.verbose, "scan", f"Using exclude globs: {exclude_globs}")
 
     findings, warnings = scan_target(
         target,
@@ -2168,16 +2221,16 @@ def run_scan(args: argparse.Namespace) -> int:
         exclude_globs=exclude_globs,
         verbose=args.verbose,
     )
-    verbose_log(args.verbose, f"Deterministic scan produced {len(findings)} findings and {len(warnings)} warnings")
+    progress_log(args.verbose, "scan", f"Deterministic scan produced {len(findings)} findings and {len(warnings)} warnings")
     agent_run: AgentRun | None = None
     llm_summary: dict[str, object] | None = None
     if args.agent:
-        verbose_log(args.verbose, f"Running agent mode with up to {args.agent_max_actions} actions")
+        progress_log(args.verbose, "agent", f"Running agent mode with up to {args.agent_max_actions} actions")
         agent_run = run_agent_mode(target, findings, args, exclude_globs=exclude_globs)
         llm_summary = agent_run.llm_summary
         warnings.extend(agent_run.warnings)
     elif not args.no_llm and findings:
-        verbose_log(args.verbose, f"Requesting LLM summary with model {args.model}")
+        progress_log(args.verbose, "llm", f"Requesting LLM summary with model {args.model}")
         try:
             llm_summary = generate_llm_summary(
                 args.ollama_url,
@@ -2188,27 +2241,27 @@ def run_scan(args: argparse.Namespace) -> int:
                 verbose=args.verbose,
             )
             llm_summary = normalize_llm_summary(llm_summary)
-            verbose_log(args.verbose, "LLM summary completed")
+            progress_log(args.verbose, "llm", "LLM summary completed")
         except RuntimeError as exc:
             warnings.append(str(exc))
-            verbose_log(args.verbose, f"LLM summary failed: {exc}")
+            progress_log(args.verbose, "llm", f"LLM summary failed: {exc}")
     elif args.no_llm:
-        verbose_log(args.verbose, "LLM summary disabled with --no-llm")
+        progress_log(args.verbose, "llm", "LLM summary disabled with --no-llm")
     else:
-        verbose_log(args.verbose, "Skipping LLM summary because no findings were produced")
+        progress_log(args.verbose, "llm", "Skipping LLM summary because no findings were produced")
 
     report = render_report(args, target, findings, warnings, llm_summary=llm_summary, agent_run=agent_run)
     write_report(output_path, report)
-    verbose_log(args.verbose, "Report written successfully")
+    progress_log(args.verbose, "report", "Report written successfully")
     print("\n".join(summarize_findings(findings, warnings, agent_run=agent_run)))
 
     statuses = detect_tools()
     missing_required = [tool.name for tool in statuses if tool.required and not tool.path]
     fatal_warnings = [warning for warning in warnings if is_fatal_warning(warning)]
     if missing_required:
-        verbose_log(args.verbose, f"Missing required tools: {missing_required}")
+        progress_log(args.verbose, "scan", f"Missing required tools: {missing_required}")
     if warnings:
-        verbose_log(args.verbose, f"Scan completed with warnings: {warnings}")
+        progress_log(args.verbose, "scan", f"Scan completed with warnings: {warnings}")
     return EXIT_ERROR if missing_required or fatal_warnings else EXIT_OK
 
 

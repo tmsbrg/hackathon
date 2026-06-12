@@ -47,8 +47,12 @@ class CliContractTests(unittest.TestCase):
             with mock.patch("sys.stdout", stdout):
                 cli.main(["--verbose", "scan", str(target), "--output", str(output), "--no-llm"])
 
-            self.assertIn("[doc-triage] Starting scan", stdout.getvalue())
-            self.assertIn("[doc-triage] Report written successfully", stdout.getvalue())
+            rendered = stdout.getvalue()
+            self.assertIn("[doc-triage] [scan] Starting scan", rendered)
+            self.assertIn("[doc-triage] [inventory] Prepared", rendered)
+            self.assertIn("[doc-triage] [scanners] Running external scanners", rendered)
+            self.assertIn("[doc-triage] [llm] LLM summary disabled with --no-llm", rendered)
+            self.assertIn("[doc-triage] [report] Report written successfully", rendered)
 
 
 if __name__ == "__main__":
