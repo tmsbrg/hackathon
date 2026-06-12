@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from doc_triage import cli
 
@@ -42,7 +43,8 @@ class ScanLogicTests(unittest.TestCase):
         self.assertEqual(deduped[0].severity, "high")
         self.assertEqual(deduped[0].detector, "rga")
 
-    def test_scan_target_marks_sensitive_filenames_even_without_text_hits(self) -> None:
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_marks_sensitive_filenames_even_without_text_hits(self, _: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)
             secret_file = target / "id_rsa"

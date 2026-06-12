@@ -2,7 +2,9 @@ import os
 import stat
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from doc_triage import cli
 
@@ -13,8 +15,11 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
 
     def test_doctor_reports_missing_required_dependencies(self) -> None:
-        exit_code = cli.main(["doctor"])
+        stdout = StringIO()
+        with mock.patch("sys.stdout", stdout):
+            exit_code = cli.main(["doctor"])
         self.assertIn(exit_code, {0, 1})
+        self.assertIn("Required", stdout.getvalue())
 
     def test_scan_writes_report_with_restrictive_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
