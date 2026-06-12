@@ -90,6 +90,45 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(any(finding.category == "challenge-flag" for finding in findings))
 
     @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    @mock.patch("doc_triage.cli.run_command")
+    @mock.patch("doc_triage.cli.shutil.which")
+    def test_scan_target_ocr_falls_back_to_pdftoppm_and_tesseract_when_ocrmypdf_missing(
+        self,
+        which: mock.Mock,
+        run_command: mock.Mock,
+        _: mock.Mock,
+    ) -> None:
+        def which_side_effect(name: str) -> str | None:
+            mapping = {
+                "ocrmypdf": None,
+                "pdftoppm": "/usr/bin/pdftoppm",
+                "tesseract": "/usr/bin/tesseract",
+            }
+            return mapping.get(name)
+
+        def run_command_side_effect(command: list[str], **_: object) -> cli.CommandResult:
+            if command[0] == "/usr/bin/pdftoppm":
+                prefix = Path(command[-1])
+                (prefix.parent / f"{prefix.name}-1.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                return cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
+            if command[0] == "/usr/bin/tesseract":
+                return cli.CommandResult(exit_code=0, stdout="BSN (burgerservicenummer): 147258364\n", stderr="", timed_out=False)
+            raise AssertionError(f"Unexpected command: {command}")
+
+        which.side_effect = which_side_effect
+        run_command.side_effect = run_command_side_effect
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            pdf = target / "scan.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n")
+
+            findings, warnings = cli.scan_target(target, max_files=None, ocr=True)
+
+        self.assertEqual(warnings, [])
+        self.assertTrue(any(finding.metadata.get("ocr_source") == "scan.pdf" for finding in findings))
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
     @mock.patch("doc_triage.cli.collect_exif_text", return_value=("User Comment : BONUS{exif_metadata_dig}", None))
     def test_scan_target_extracts_findings_from_image_metadata(self, _: mock.Mock, __: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

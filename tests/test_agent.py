@@ -628,6 +628,77 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("Subject: hi", observations[0].evidence)
         self.assertIn("body text", observations[0].evidence)
 
+    @mock.patch("doc_triage.cli.run_command")
+    def test_execute_agent_actions_normalizes_image_ocr_light_pdf_target(self, run_command: mock.Mock) -> None:
+        run_command.return_value = cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            pdf = target / "scan.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n")
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="image_ocr_light", path="scan.pdf", reason="inspect scan", limit=5)],
+                per_action_timeout=5,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source_mechanism, "pdf_text_head")
+
+    def test_execute_agent_actions_normalizes_image_ocr_light_text_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            note = target / "note.json"
+            note.write_text('{"key":"value"}\n', encoding="utf-8")
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="image_ocr_light", path="note.json", reason="inspect note", limit=5)],
+                per_action_timeout=5,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source_mechanism, "read_head")
+
+    @mock.patch("doc_triage.cli.run_command")
+    def test_execute_agent_actions_normalizes_pdf_text_head_openxml_target(self, run_command: mock.Mock) -> None:
+        run_command.return_value = cli.CommandResult(exit_code=0, stdout="Zip archive data", stderr="", timed_out=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            sheet = target / "salary_bands_2024.xlsx"
+            sheet.write_bytes(b"PK\x03\x04")
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="pdf_text_head", path="salary_bands_2024.xlsx", reason="inspect spreadsheet", limit=5)],
+                per_action_timeout=5,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source_mechanism, "file_info")
+
+    def test_resolve_agent_action_path_accepts_unique_basename_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            archive = target / "Finance" / "payroll" / "payroll_Q3_2024.zip"
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b"PK\x03\x04")
+
+            resolved = cli.resolve_agent_action_path(target, str(target / "Finance" / "payroll_Q3_2024.zip"))
+
+        self.assertEqual(resolved, archive)
+
+    def test_resolve_agent_action_path_unwraps_virtual_container_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            document = target / "Finance" / "contracts" / "vendor_stripe_agreement.docx"
+            document.parent.mkdir(parents=True)
+            document.write_bytes(b"PK\x03\x04")
+
+            resolved = cli.resolve_agent_action_path(target, "Finance/contracts/vendor_stripe_agreement.docx::word/document.xml")
+
+        self.assertEqual(resolved, document)
+
     def test_validate_generated_helper_source_rejects_unsafe_constructs(self) -> None:
         errors = cli.validate_generated_helper_source("import subprocess\nprint('nope')\n")
 

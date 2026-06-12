@@ -849,22 +849,51 @@ def collect_ocr_findings(target: Path, files: list[Path], work_dir: Path) -> tup
                 finding.metadata["ocr_source"] = file_path.name
             findings.extend(image_findings)
         elif suffix in OCR_PDF_EXTENSIONS:
-            output_pdf = work_dir / file_path.name
-            ocr_result = run_command(["ocrmypdf", str(file_path), str(output_pdf)])
-            if ocr_result.exit_code != 0:
-                warnings.append(f"PDF OCR failed for {file_path.name}.")
+            content, warning = extract_pdf_ocr_text(file_path, work_dir)
+            if warning:
+                warnings.append(warning)
                 continue
-            text_path = work_dir / f"{file_path.stem}.txt"
-            text_result = run_command(["pdftotext", str(output_pdf), str(text_path)])
-            if text_result.exit_code != 0 or not text_path.exists():
-                warnings.append(f"PDF text extraction failed for {file_path.name}.")
-                continue
-            content = text_path.read_text(encoding="utf-8", errors="ignore")
             pdf_findings = keyword_findings(target, file_path, content)
             for finding in pdf_findings:
                 finding.metadata["ocr_source"] = file_path.name
             findings.extend(pdf_findings)
     return findings, warnings
+
+
+def extract_pdf_ocr_text(file_path: Path, work_dir: Path) -> tuple[str | None, str | None]:
+    ocrmypdf_path = shutil.which("ocrmypdf")
+    pdftotext_path = shutil.which("pdftotext")
+    pdftoppm_path = shutil.which("pdftoppm")
+    tesseract_path = shutil.which("tesseract")
+
+    if ocrmypdf_path and pdftotext_path:
+        output_pdf = work_dir / file_path.name
+        ocr_result = run_command([ocrmypdf_path, str(file_path), str(output_pdf)])
+        if ocr_result.exit_code == 0:
+            text_path = work_dir / f"{file_path.stem}.txt"
+            text_result = run_command([pdftotext_path, str(output_pdf), str(text_path)])
+            if text_result.exit_code == 0 and text_path.exists():
+                return text_path.read_text(encoding="utf-8", errors="ignore"), None
+
+    if not pdftoppm_path or not tesseract_path:
+        return None, f"PDF OCR failed for {file_path.name}."
+
+    image_prefix = work_dir / file_path.stem
+    rasterize_result = run_command([pdftoppm_path, "-png", str(file_path), str(image_prefix)], timeout=60, max_output_chars=4000)
+    if rasterize_result.exit_code != 0:
+        return None, f"PDF OCR failed for {file_path.name}."
+    pages = sorted(work_dir.glob(f"{file_path.stem}-*.png"))
+    if not pages:
+        return None, f"PDF OCR failed for {file_path.name}."
+    page_texts: list[str] = []
+    for page in pages[:10]:
+        result = run_command([tesseract_path, str(page), "stdout"], timeout=60, max_output_chars=12000)
+        if result.exit_code != 0:
+            continue
+        page_texts.append(result.stdout)
+    if not page_texts:
+        return None, f"PDF OCR failed for {file_path.name}."
+    return "\n".join(page_texts), None
 
 
 def request_ollama_text(ollama_url: str, body: dict[str, object], timeout_seconds: int = 180) -> str:
@@ -2573,6 +2602,8 @@ def classify_agent_target(candidate: Path) -> str:
     suffix = candidate.suffix.lower()
     if suffix == ".eml":
         return "email"
+    if suffix in {".docx", ".xlsx", ".pptx"}:
+        return "openxml"
     if suffix in OCR_IMAGE_EXTENSIONS:
         return "image"
     if suffix in OCR_PDF_EXTENSIONS:
@@ -2591,6 +2622,40 @@ def classify_agent_target(candidate: Path) -> str:
     if mime_guess.startswith("text/"):
         return "text"
     return "binary"
+
+
+def normalize_agent_action_for_target(action: AgentAction, candidate: Path | None) -> AgentAction:
+    if candidate is None:
+        return action
+    target_type = classify_agent_target(candidate)
+    normalized = AgentAction(
+        kind=action.kind,
+        reason=action.reason,
+        path=action.path,
+        query=action.query,
+        limit=action.limit,
+        code=action.code,
+        metadata=dict(action.metadata),
+    )
+    if candidate.is_dir():
+        if normalized.kind in {"read_head", "dir_list"}:
+            normalized.kind = "dir_list"
+        return normalized
+    if target_type == "email" and normalized.kind in {"read_head", "image_ocr_light", "pdf_text_head"}:
+        normalized.kind = "email_parse"
+    elif target_type == "pdf" and normalized.kind in {"read_head", "image_ocr_light"}:
+        normalized.kind = "pdf_text_head"
+    elif target_type == "image" and normalized.kind in {"read_head", "pdf_text_head"}:
+        normalized.kind = "image_ocr_light"
+    elif target_type == "archive" and normalized.kind in {"read_head", "pdf_text_head", "image_ocr_light"}:
+        normalized.kind = "zip_list"
+    elif target_type == "openxml" and normalized.kind in {"read_head", "pdf_text_head", "image_ocr_light", "zip_list"}:
+        normalized.kind = "file_info"
+    elif target_type == "binary" and normalized.kind in {"read_head", "pdf_text_head", "image_ocr_light"}:
+        normalized.kind = "file_info"
+    elif target_type == "text" and normalized.kind in {"image_ocr_light", "pdf_text_head"}:
+        normalized.kind = "read_head"
+    return normalized
 
 
 def validate_agent_action_target(action: AgentAction, candidate: Path | None) -> str | None:
@@ -2625,6 +2690,9 @@ def validate_agent_action_target(action: AgentAction, candidate: Path | None) ->
 
 
 def resolve_agent_action_path(target: Path, path: str) -> Path | None:
+    if "::" in path:
+        container, _ = path.split("::", 1)
+        path = container.strip()
     if path in {"", "."}:
         return target.resolve()
 
@@ -2633,7 +2701,8 @@ def resolve_agent_action_path(target: Path, path: str) -> Path | None:
     if raw.is_absolute():
         try:
             raw.relative_to(target_root)
-            return raw
+            if raw.exists():
+                return raw
         except ValueError:
             return None
 
@@ -2654,6 +2723,23 @@ def resolve_agent_action_path(target: Path, path: str) -> Path | None:
     direct = safe_relative_path(target, path)
     if direct is not None and direct.exists():
         return direct
+    basename = raw.name
+    if basename:
+        basename_matches = sorted(path_candidate for path_candidate in target.rglob(basename) if path_candidate.is_file() or path_candidate.is_dir())
+        if len(basename_matches) == 1:
+            return basename_matches[0]
+    parts = [part for part in raw.parts if part not in {"", "."}]
+    if parts:
+        suffix_fragment = str(Path(*parts[-2:])) if len(parts) >= 2 else parts[-1]
+        suffix_matches = []
+        for path_candidate in target.rglob("*"):
+            if not (path_candidate.is_file() or path_candidate.is_dir()):
+                continue
+            rel = relative_source(target, path_candidate)
+            if rel.endswith(suffix_fragment):
+                suffix_matches.append(path_candidate)
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
     return None
 
 
@@ -2674,15 +2760,16 @@ def execute_agent_actions(
             warnings.append(f"unsupported agent action: {action.kind}")
             continue
         candidate = resolve_agent_action_path(target, action.path)
-        target_warning = validate_agent_action_target(action, candidate)
+        normalized_action = normalize_agent_action_for_target(action, candidate)
+        target_warning = validate_agent_action_target(normalized_action, candidate)
         if target_warning is not None:
             warnings.append(target_warning)
             continue
         try:
-            if action.kind == "generated_python_helper":
+            if normalized_action.kind == "generated_python_helper":
                 generated_observations, helper_warnings = execute_generated_helper(
                     target,
-                    action,
+                    normalized_action,
                     action_timeout,
                     ollama_url=ollama_url,
                     model=model,
@@ -2692,7 +2779,7 @@ def execute_agent_actions(
                 observations.extend(generated_observations)
                 warnings.extend(helper_warnings)
                 continue
-            if action.kind == "read_head" and candidate is not None and candidate.is_dir():
+            if normalized_action.kind == "read_head" and candidate is not None and candidate.is_dir():
                 entries = sorted(path.name for path in candidate.iterdir())[: action.limit]
                 observations.append(
                     normalize_agent_observation(
@@ -2705,7 +2792,7 @@ def execute_agent_actions(
                     )
                 )
                 continue
-            if action.kind == "read_head" and candidate is not None and candidate.is_file():
+            if normalized_action.kind == "read_head" and candidate is not None and candidate.is_file():
                 output = candidate.read_text(encoding="utf-8", errors="ignore")[: min(action.limit * 120, 4000)]
                 observations.append(
                     normalize_agent_observation(
@@ -2717,7 +2804,7 @@ def execute_agent_actions(
                         metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
-            elif action.kind == "strings_head" and candidate is not None and candidate.is_file():
+            elif normalized_action.kind == "strings_head" and candidate is not None and candidate.is_file():
                 result = run_command(["strings", "-n", "6", str(candidate)], timeout=action_timeout, max_output_chars=4000)
                 observations.append(
                     normalize_agent_observation(
@@ -2733,7 +2820,7 @@ def execute_agent_actions(
                 )
                 if result.timed_out:
                     warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
-            elif action.kind == "zip_list" and candidate is not None and candidate.is_file():
+            elif normalized_action.kind == "zip_list" and candidate is not None and candidate.is_file():
                 result = list_archive_contents(candidate, timeout=action_timeout, max_output_chars=4000)
                 observations.append(
                     normalize_agent_observation(
@@ -2749,7 +2836,7 @@ def execute_agent_actions(
                 )
                 if result.timed_out:
                     warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
-            elif action.kind == "pdf_text_head" and candidate is not None and candidate.is_file():
+            elif normalized_action.kind == "pdf_text_head" and candidate is not None and candidate.is_file():
                 with tempfile.TemporaryDirectory(prefix="doc-triage-agent-pdf-") as temp_dir:
                     text_path = Path(temp_dir) / f"{candidate.stem}.txt"
                     result = run_command(["pdftotext", str(candidate), str(text_path)], timeout=action_timeout, max_output_chars=2000)
@@ -2769,7 +2856,7 @@ def execute_agent_actions(
                     )
                     if result.timed_out:
                         warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
-            elif action.kind == "file_info" and candidate is not None:
+            elif normalized_action.kind == "file_info" and candidate is not None:
                 result = run_command(["file", "-b", str(candidate)], timeout=action_timeout, max_output_chars=1000)
                 observations.append(
                     normalize_agent_observation(
@@ -2784,7 +2871,7 @@ def execute_agent_actions(
                 )
                 if result.timed_out:
                     warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
-            elif action.kind == "email_parse" and candidate is not None:
+            elif normalized_action.kind == "email_parse" and candidate is not None:
                 payload = candidate.read_bytes()
                 message = BytesParser(policy=policy.default).parsebytes(payload)
                 headers = []
@@ -2828,7 +2915,7 @@ def execute_agent_actions(
                         metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
-            elif action.kind == "exiftool_info" and candidate is not None:
+            elif normalized_action.kind == "exiftool_info" and candidate is not None:
                 exiftool_path = shutil.which("exiftool")
                 if exiftool_path is None:
                     warnings.append(f"agent action skipped unavailable tool: exiftool for {action.path}")
@@ -2848,7 +2935,7 @@ def execute_agent_actions(
                 )
                 if result.timed_out:
                     warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
-            elif action.kind == "image_ocr_light" and candidate is not None:
+            elif normalized_action.kind == "image_ocr_light" and candidate is not None:
                 tesseract_path = shutil.which("tesseract")
                 if tesseract_path is None:
                     warnings.append(f"agent action skipped unavailable tool: tesseract for {action.path}")
@@ -2874,7 +2961,7 @@ def execute_agent_actions(
                     )
                     if result.timed_out:
                         warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
-            elif action.kind == "dir_list" and candidate is not None and candidate.is_dir():
+            elif normalized_action.kind == "dir_list" and candidate is not None and candidate.is_dir():
                 entries = sorted(path.name for path in candidate.iterdir())[: action.limit]
                 observations.append(
                     normalize_agent_observation(
@@ -2886,7 +2973,7 @@ def execute_agent_actions(
                         metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
-            elif action.kind == "content_search":
+            elif normalized_action.kind == "content_search":
                 result = run_command(
                     ["rga", "-n", action.query, str(target)],
                     timeout=action_timeout,
@@ -2910,7 +2997,7 @@ def execute_agent_actions(
                     )
                 if result.timed_out:
                     warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.query or action.path}")
-            elif action.kind == "filename_search":
+            elif normalized_action.kind == "filename_search":
                 result = run_command(
                     ["rg", "--files", str(target), "-g", action.query],
                     timeout=action_timeout,

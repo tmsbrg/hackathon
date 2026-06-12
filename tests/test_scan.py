@@ -28,6 +28,22 @@ class ScanLogicTests(unittest.TestCase):
 
         self.assertEqual(findings, [])
 
+    def test_keyword_findings_detects_contextual_ocr_password_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "ocr.txt"
+            path.write_text(
+                "Integration settings (do not share):\n\n"
+                "F}&: wms_service\n"
+                "2255: ShaWMS-2024-Rot\n",
+                encoding="utf-8",
+            )
+
+            findings = cli.keyword_findings(target, path, path.read_text(encoding="utf-8"))
+
+        self.assertTrue(any(f.detector == "contextual-ocr-credential" for f in findings))
+        self.assertTrue(any("ShaWMS-2024-Rot" in f.evidence for f in findings))
+
     def test_classify_match_detects_http_only_cookie(self) -> None:
         classification = cli.classify_match(
             '"set-cookie" : "__cfduid=abc; expires=Mon, 27-Jun-16 15:56:37 GMT; path=/; domain=.example.com; HttpOnly",'

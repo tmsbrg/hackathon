@@ -139,9 +139,36 @@ def extract_digit_runs(text: str) -> list[str]:
     return re.findall(r"\b\d{9}\b", text)
 
 
+def contextual_credential_candidate(line: str, previous_lines: Sequence[str]) -> Finding | None:
+    lowered_context = " ".join(previous.lower() for previous in previous_lines[-3:])
+    if not any(marker in lowered_context for marker in ("do not share", "integration settings", "session established", "login")):
+        return None
+    match = re.search(r":\s*([A-Za-z][A-Za-z0-9_-]{7,})\s*$", line)
+    if not match:
+        return None
+    candidate = match.group(1)
+    if "." in candidate or "/" in candidate:
+        return None
+    if not any(char.isdigit() for char in candidate):
+        return None
+    if "-" not in candidate and "_" not in candidate:
+        return None
+    return Finding(
+        source="",
+        category="credential",
+        severity="high",
+        detector="contextual-ocr-credential",
+        evidence=line,
+        line=None,
+        confidence=0.88,
+        metadata={"candidate": candidate},
+    )
+
+
 def keyword_findings(target: Path, file_path: Path, content: str) -> list[Finding]:
     findings: list[Finding] = []
     invalid_bsn_context = False
+    previous_lines: list[str] = []
     for line_number, line in enumerate(content.splitlines(), start=1):
         lowered_line = line.lower()
         if any(marker in lowered_line for marker in ("invalid bsn", "bsn for testing", "test user sandbox", "sandbox")):
@@ -165,6 +192,12 @@ def keyword_findings(target: Path, file_path: Path, content: str) -> list[Findin
                     metadata={},
                 )
             )
+        else:
+            contextual = contextual_credential_candidate(line, previous_lines)
+            if contextual is not None:
+                contextual.source = relative_source(target, file_path)
+                contextual.line = line_number
+                findings.append(contextual)
         for candidate in extract_digit_runs(line):
             if is_valid_bsn(candidate):
                 findings.append(
@@ -197,6 +230,7 @@ def keyword_findings(target: Path, file_path: Path, content: str) -> list[Findin
                         metadata={"bsn": candidate, "validation": "candidate"},
                     )
                 )
+        previous_lines.append(line)
     return findings
 
 
