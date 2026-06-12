@@ -14,6 +14,14 @@ class CliContractTests(unittest.TestCase):
         exit_code = cli.main([])
         self.assertEqual(exit_code, 2)
 
+    def test_scan_rejects_negative_model_retries(self) -> None:
+        stderr = StringIO()
+        with mock.patch("sys.stderr", stderr):
+            exit_code = cli.main(["scan", "/tmp", "--no-llm", "--model-retries", "-1"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("--model-retries must be >= 0", stderr.getvalue())
+
     def test_doctor_reports_missing_required_dependencies(self) -> None:
         stdout = StringIO()
         with mock.patch("sys.stdout", stdout):

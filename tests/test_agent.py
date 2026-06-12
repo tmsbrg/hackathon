@@ -323,6 +323,45 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(summary["executive_summary"], "fixed")
 
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_summary_uses_configured_retry_budget(self, urlopen: mock.Mock) -> None:
+        first = mock.Mock()
+        first.__enter__ = mock.Mock(return_value=first)
+        first.__exit__ = mock.Mock(return_value=False)
+        first.read.return_value = json.dumps({"response": "{broken"}).encode("utf-8")
+
+        second = mock.Mock()
+        second.__enter__ = mock.Mock(return_value=second)
+        second.__exit__ = mock.Mock(return_value=False)
+        second.read.return_value = json.dumps({"response": "still bad"}).encode("utf-8")
+
+        third = mock.Mock()
+        third.__enter__ = mock.Mock(return_value=third)
+        third.__exit__ = mock.Mock(return_value=False)
+        third.read.return_value = json.dumps(
+            {
+                "response": json.dumps(
+                    {
+                        "executive_summary": "fixed on third try",
+                        "priority_findings": [],
+                        "relationships": [],
+                        "review_order": [],
+                    }
+                )
+            }
+        ).encode("utf-8")
+        urlopen.side_effect = [first, second, third]
+
+        summary = cli.request_agent_summary(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            {"instructions": ["Return executive_summary, priority_findings, relationships, review_order"]},
+            model_retries=2,
+        )
+
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(summary["executive_summary"], "fixed on third try")
+
     @mock.patch("doc_triage.cli.run_command")
     @mock.patch("doc_triage.cli.shutil.which", return_value="/usr/bin/bwrap")
     def test_execute_generated_helper_parses_observations(self, _: mock.Mock, run_command: mock.Mock) -> None:
@@ -386,6 +425,45 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("/input", command)
         self.assertIn("--bind", command)
         self.assertIn("/work", command)
+
+    @mock.patch("doc_triage.cli.request_generated_helper_repair")
+    @mock.patch("doc_triage.cli.run_command")
+    @mock.patch("doc_triage.cli.shutil.which", return_value="/usr/bin/bwrap")
+    def test_execute_generated_helper_retries_after_syntax_error(
+        self,
+        _: mock.Mock,
+        run_command: mock.Mock,
+        request_generated_helper_repair: mock.Mock,
+    ) -> None:
+        request_generated_helper_repair.return_value = cli.AgentAction(
+            kind="generated_python_helper",
+            reason="inspect",
+            code="import json\nprint(json.dumps({'path':'docs/a.txt','evidence':'secret=1'}))\n",
+        )
+        run_command.return_value = cli.CommandResult(
+            exit_code=0,
+            stdout='{"path":"docs/a.txt","evidence":"secret=1"}\n',
+            stderr="",
+            timed_out=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            observations, warnings = cli.execute_generated_helper(
+                Path(tmpdir),
+                cli.AgentAction(
+                    kind="generated_python_helper",
+                    reason="inspect",
+                    code="def broken(:\n    pass\n",
+                ),
+                timeout_seconds=5,
+                ollama_url="http://127.0.0.1:11434",
+                model="qwen3:8b",
+                model_retries=1,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        request_generated_helper_repair.assert_called_once()
 
     @mock.patch("doc_triage.cli.request_agent_plan")
     @mock.patch("doc_triage.cli.execute_agent_actions")
