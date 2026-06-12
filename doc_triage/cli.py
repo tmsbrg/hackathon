@@ -4122,6 +4122,7 @@ def build_hypothesis_focus_prompt(
         "remaining_action_budget": remaining_action_budget,
         "subagent_roles": AGENT_ROLE_CATALOG,
         "hypothesis": asdict(hypothesis),
+        "branch_families": summarize_hypothesis_branches_for_llm([hypothesis], observations, max_items=2),
         "recon": recon,
         "existing_actions": [asdict(action) for action in existing_actions[:12]],
         "findings": [
@@ -4164,6 +4165,7 @@ def build_role_focus_prompt(
         "role_mission": AGENT_ROLE_CATALOG.get(role, ""),
         "remaining_action_budget": remaining_action_budget,
         "hypotheses": [asdict(hypothesis) for hypothesis in hypotheses[:4]],
+        "branch_families": summarize_hypothesis_branches_for_llm(hypotheses, observations, max_items=4),
         "recon": recon,
         "existing_actions": [asdict(action) for action in existing_actions[:12]],
         "findings": [
@@ -4286,6 +4288,7 @@ def build_agent_coordinator_prompt(
         "subagent_roles": AGENT_ROLE_CATALOG,
         "recon": recon,
         "hypotheses": [asdict(hypothesis) for hypothesis in hypotheses[:12]],
+        "branch_families": summarize_hypothesis_branches_for_llm(hypotheses, observations, max_items=8),
         "hypothesis_evidence": summarize_hypothesis_observations_for_llm(hypotheses, observations, max_items=12),
         "actions": [asdict(action) for action in actions[:12]],
         "observations": [asdict(observation) for observation in observations[:20]],
@@ -4317,6 +4320,7 @@ def build_role_review_prompt(
         "role_mission": AGENT_ROLE_CATALOG.get(role, ""),
         "recon": recon,
         "hypotheses": [asdict(hypothesis) for hypothesis in hypotheses[:8]],
+        "branch_families": summarize_hypothesis_branches_for_llm(hypotheses, observations, max_items=4),
         "hypothesis_evidence": summarize_hypothesis_observations_for_llm(hypotheses, observations, max_items=8),
         "actions": [asdict(action) for action in actions[:8]],
         "observations": [asdict(observation) for observation in observations[:12]],
@@ -4952,6 +4956,75 @@ def summarize_hypothesis_observations_for_llm(
                         "evidence": summarize_evidence(observation.evidence, limit=evidence_limit),
                     }
                     for observation in ranked[:3]
+                ],
+            }
+        )
+        if len(summaries) >= max_items:
+            break
+    return summaries
+
+
+def summarize_hypothesis_branches_for_llm(
+    hypotheses: Sequence[AgentHypothesis],
+    observations: Sequence[AgentObservation],
+    max_items: int = 6,
+    evidence_limit: int = 140,
+) -> list[dict[str, object]]:
+    grouped: dict[str, list[AgentHypothesis]] = {}
+    for hypothesis in hypotheses:
+        for path in hypothesis.evidence_paths:
+            normalized = path.strip()
+            if not normalized:
+                continue
+            grouped.setdefault(normalized, []).append(hypothesis)
+
+    summaries: list[dict[str, object]] = []
+    for evidence_path, grouped_hypotheses in sorted(
+        grouped.items(),
+        key=lambda item: (-len(item[1]), item[0]),
+    ):
+        unique_labels = {item.label for item in grouped_hypotheses}
+        if len(unique_labels) < 2:
+            continue
+        related_observations = [
+            observation
+            for observation in observations
+            if observation.path == evidence_path
+            or (
+                observation.hypothesis_label
+                and any(observation.hypothesis_label == hypothesis.label for hypothesis in grouped_hypotheses)
+            )
+        ]
+        ranked_observations = sorted(
+            related_observations,
+            key=lambda observation: (
+                -observation.confidence,
+                observation.path,
+                observation.source_mechanism,
+            ),
+        )
+        summaries.append(
+            {
+                "evidence_path": evidence_path,
+                "hypotheses": [
+                    {
+                        "label": hypothesis.label,
+                        "role": hypothesis.role,
+                        "status": hypothesis.status,
+                        "notes": hypothesis.notes,
+                    }
+                    for hypothesis in grouped_hypotheses[:6]
+                ],
+                "top_observations": [
+                    {
+                        "path": observation.path,
+                        "role": observation.role,
+                        "hypothesis_label": observation.hypothesis_label,
+                        "derived_claim": observation.derived_claim,
+                        "confidence": observation.confidence,
+                        "evidence": summarize_evidence(observation.evidence, limit=evidence_limit),
+                    }
+                    for observation in ranked_observations[:3]
                 ],
             }
         )

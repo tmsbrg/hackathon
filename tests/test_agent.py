@@ -545,6 +545,61 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(prompt["hypothesis_evidence"][0]["label"], "VPN token reuse")
         self.assertEqual(prompt["hypothesis_evidence"][0]["top_observations"][0]["path"], "vpn.txt")
 
+    def test_summarize_hypothesis_branches_for_llm_groups_sibling_hypotheses(self) -> None:
+        hypotheses = [
+            cli.AgentHypothesis(label="Payroll records", rationale="employee data", role="identity_reviewer", evidence_paths=["Finance/payroll.txt"]),
+            cli.AgentHypothesis(label="IBAN exposure", rationale="bank identifiers", role="identity_reviewer", evidence_paths=["Finance/payroll.txt"]),
+            cli.AgentHypothesis(label="VPN token reuse", rationale="auth clue", role="credential_hunter", evidence_paths=["vpn.txt"]),
+        ]
+        observations = [
+            cli.AgentObservation(
+                path="Finance/payroll.txt",
+                evidence="salary and iban references",
+                source_mechanism="read_head",
+                confidence=0.88,
+                role="document_analyst",
+                hypothesis_label="IBAN exposure",
+                derived_claim="Found payroll and IBAN material",
+            )
+        ]
+
+        summary = cli.summarize_hypothesis_branches_for_llm(hypotheses, observations, max_items=4)
+
+        self.assertEqual(summary[0]["evidence_path"], "Finance/payroll.txt")
+        self.assertEqual({item["label"] for item in summary[0]["hypotheses"]}, {"Payroll records", "IBAN exposure"})
+        self.assertEqual(summary[0]["top_observations"][0]["path"], "Finance/payroll.txt")
+
+    def test_build_role_focus_prompt_includes_branch_family_context(self) -> None:
+        hypotheses = [
+            cli.AgentHypothesis(label="Payroll records", rationale="employee data", role="identity_reviewer", evidence_paths=["Finance/payroll.txt"]),
+            cli.AgentHypothesis(label="IBAN exposure", rationale="bank identifiers", role="identity_reviewer", evidence_paths=["Finance/payroll.txt"]),
+        ]
+        observations = [
+            cli.AgentObservation(
+                path="Finance/payroll.txt",
+                evidence="salary and iban references",
+                source_mechanism="read_head",
+                confidence=0.88,
+                role="document_analyst",
+                hypothesis_label="IBAN exposure",
+                derived_claim="Found payroll and IBAN material",
+            )
+        ]
+
+        prompt = cli.build_role_focus_prompt(
+            Path("/tmp/case"),
+            {"representative_heads": []},
+            [],
+            observations,
+            "identity_reviewer",
+            hypotheses,
+            [],
+            4,
+        )
+
+        self.assertEqual(prompt["branch_families"][0]["evidence_path"], "Finance/payroll.txt")
+        self.assertEqual({item["label"] for item in prompt["branch_families"][0]["hypotheses"]}, {"Payroll records", "IBAN exposure"})
+
     def test_prioritize_roles_for_followup_prefers_inconclusive_hypotheses_with_strong_observations(self) -> None:
         hypotheses = [
             cli.AgentHypothesis(label="credential lead", rationale="token clue", status="inconclusive", role="credential_hunter"),
