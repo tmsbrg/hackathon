@@ -205,6 +205,61 @@ def group_actions_by_role(actions: Sequence["AgentAction"]) -> list[tuple[str, l
     return [(role, grouped[role]) for role in order]
 
 
+def prioritize_roles_for_followup(
+    hypotheses: Sequence[AgentHypothesis],
+    actions: Sequence[AgentAction],
+    observations: Sequence[AgentObservation],
+) -> list[str]:
+    scores: dict[str, int] = {}
+    order: list[str] = []
+
+    def _touch(role: str) -> None:
+        if role and role not in scores:
+            scores[role] = 0
+            order.append(role)
+
+    for hypothesis in hypotheses:
+        role = hypothesis.role.strip() or infer_agent_role(hypothesis.label, hypothesis.rationale)
+        _touch(role)
+        if hypothesis.status == "inconclusive":
+            scores[role] += 3
+        elif hypothesis.status == "confirmed":
+            scores[role] += 1
+        elif hypothesis.status == "rejected":
+            scores[role] -= 2
+        if hypothesis.evidence_paths:
+            scores[role] += min(2, len(hypothesis.evidence_paths))
+    for action in actions:
+        role = action.role.strip() or infer_agent_role(action.reason, source=action.query or action.path)
+        _touch(role)
+        scores[role] += 1
+        if action.kind in {"content_search", "generated_python_helper", "zip_list"}:
+            scores[role] += 1
+    for observation in observations:
+        role = observation.role.strip() or infer_agent_role(observation.derived_claim, source=observation.path)
+        _touch(role)
+        if observation.confidence >= 0.8:
+            scores[role] += 2
+        elif observation.confidence >= 0.5:
+            scores[role] += 1
+
+    return sorted(order, key=lambda role: (-scores.get(role, 0), order.index(role)))
+
+
+def sort_action_groups_by_role_priority(
+    grouped_actions: Sequence[tuple[str, list[AgentAction]]],
+    role_priority: Sequence[str],
+) -> list[tuple[str, list[AgentAction]]]:
+    priority_index = {role: index for index, role in enumerate(role_priority)}
+    return sorted(
+        grouped_actions,
+        key=lambda item: (
+            priority_index.get(item[0], len(priority_index)),
+            item[0],
+        ),
+    )
+
+
 def infer_observation_handoff_targets(observation: AgentObservation) -> list[tuple[str, str]]:
     combined = " ".join(
         part for part in (observation.path, observation.evidence, observation.derived_claim, observation.source_mechanism) if part
@@ -4108,6 +4163,9 @@ def run_agent_mode(
             if len(second_batch) >= remaining_budget:
                 break
     if second_batch:
+        role_priority = prioritize_roles_for_followup(all_hypotheses, second_batch, observations)
+        if role_priority:
+            progress_log(args.verbose, "agent", f"Coordinator scheduled next roles: {', '.join(role_priority)}")
         progress_log(
             args.verbose,
             "agent",
@@ -4115,7 +4173,13 @@ def run_agent_mode(
         )
     followup_observations: list[AgentObservation] = []
     followup_warnings: list[str] = []
-    for role, role_actions in group_actions_by_role(second_batch):
+    grouped_followup = group_actions_by_role(second_batch)
+    if second_batch:
+        grouped_followup = sort_action_groups_by_role_priority(
+            grouped_followup,
+            prioritize_roles_for_followup(all_hypotheses, second_batch, observations),
+        )
+    for role, role_actions in grouped_followup:
         progress_log(
             args.verbose,
             "agent",

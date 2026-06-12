@@ -154,7 +154,7 @@ SIGNAL_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, str, float]], ...] = (
     (re.compile(r"\b(?:hasło|haslo|heslo|jelszó|jelszo|parola|adgangskode|kodeord|lösenord|losenord|passord|salasana)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.95)),
     (re.compile(r"\b(?:şifre|sifre|пароль|κωδικός|κωδικός πρόσβασης|كلمة المرور|كلمه المرور|رمز المرور|סיסמה|رمز عبور|گذرواژه|पासवर्ड|कूटशब्द|密码|密碼|口令|登录密码|登入密碼|パスワード|비밀번호|암호|kata sandi|katasandi|sandi|laluan|mật khẩu|mat khau|รหัสผ่าน)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.95)),
     (re.compile(r"\b(secret|client_secret)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
-    (re.compile(r"\bshared secret\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
+    (re.compile(r"\bshared(?:[ _-]?)secret\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
     (re.compile(r"\baws_secret_access_key\b", re.IGNORECASE), ("credential", "high", 0.95)),
     (re.compile(r"\b[\w-]*token\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
     (re.compile(r"\b(?:login|credential|credentials|inloggegevens|aanmeldgegevens|identifiants|zugangsdaten|anmeldedaten|credenciales|credenziali|credenciais|dane logowania|poświadczenia|prihlasovaci udaje|prihlasovacie udaje|bejelentkezési adatok|date de autentificare|loginoplysninger|inloggningsuppgifter|innloggingsinformasjon|kirjautumistiedot|giriş bilgileri|учетные данные|учётные данные|облікові дані|بيانات الاعتماد|פרטי התחברות|認証情報|ログイン情報|로그인 정보|thông tin đăng nhập|ข้อมูลเข้าสู่ระบบ)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),

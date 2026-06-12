@@ -29,7 +29,7 @@ FULL_VALUE_HIGHLIGHT_PATTERNS = (
 )
 ASSIGNMENT_VALUE_PATTERNS = (
     re.compile(
-        r"(?i)\b(?:password|passwd|pwd|wachtwoord|tijdelijk_wachtwoord|secret|client_secret|token|github_token|api_key(?:_value)?|access_key_id|secret_access_key|burgerservicenummer|bsn)\b[^:=\n]*[:=]\s*[\"']?([^\"'\s,`]+)"
+        r"(?i)\b(?:password|passwd|pwd|pass|passphrase|wachtwoord|tijdelijk_wachtwoord|secret|secretkey|secret_key|shared_secret|client_secret|db_password|database_password|mysql_password|postgres_password|oracle_password|sa_password|admin_password|root_password|login_password|user_password|api_secret|consumer_secret|private_key|access_key|access_token|refresh_token|auth_token|bearer_token|token|github_token|api_key(?:_value)?|access_key_id|secret_access_key|burgerservicenummer|bsn)\b[^:=\n]*[:=]\s*[\"']?([^\"'\s,`]+)"
     ),
 )
 RAW_SECRET_BLOB_PATTERN = re.compile(r"^[A-Za-z0-9+/=_-]{24,}$")

@@ -399,6 +399,23 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(updated[0].status, "confirmed")
         self.assertIn("docs/a.txt", updated[0].evidence_paths)
 
+    def test_prioritize_roles_for_followup_prefers_inconclusive_hypotheses_with_strong_observations(self) -> None:
+        hypotheses = [
+            cli.AgentHypothesis(label="credential lead", rationale="token clue", status="inconclusive", role="credential_hunter"),
+            cli.AgentHypothesis(label="document lead", rationale="general notes", status="confirmed", role="document_analyst"),
+        ]
+        actions = [
+            cli.AgentAction(kind="content_search", query="password", reason="search creds", role="credential_hunter"),
+            cli.AgentAction(kind="read_head", path="docs/a.txt", reason="inspect docs", role="document_analyst"),
+        ]
+        observations = [
+            cli.AgentObservation(path="docs/a.txt", evidence="token noted", source_mechanism="read_head", confidence=0.95, role="credential_hunter"),
+        ]
+
+        ordered = cli.prioritize_roles_for_followup(hypotheses, actions, observations)
+
+        self.assertEqual(ordered[0], "credential_hunter")
+
     @mock.patch("doc_triage.cli.request_agent_coordination")
     def test_run_agent_mode_applies_coordinator_updates(self, request_agent_coordination: mock.Mock) -> None:
         request_agent_coordination.return_value = [
@@ -1647,6 +1664,69 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(any("document_analyst" in (action.reason or "") for action in followup_actions))
         self.assertGreaterEqual(request_agent_plan.call_count, 3)
         self.assertTrue(any(observation.role == "credential_hunter" for observation in run.observations))
+
+    @mock.patch("doc_triage.cli.request_agent_summary", return_value={"executive_summary": "done", "priority_findings": [], "relationships": [], "review_order": []})
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    @mock.patch("doc_triage.cli.request_agent_coordination", return_value=[])
+    @mock.patch("doc_triage.cli.execute_agent_actions")
+    def test_run_agent_mode_schedules_followup_roles_by_coordinator_priority(
+        self,
+        execute_agent_actions: mock.Mock,
+        _: mock.Mock,
+        request_agent_plan: mock.Mock,
+        __: mock.Mock,
+    ) -> None:
+        request_agent_plan.side_effect = [
+            (
+                [cli.AgentHypothesis(label="review docs", rationale="doc trail", role="document_analyst")],
+                [cli.AgentAction(kind="read_head", path="docs/a.txt", reason="inspect doc", role="document_analyst")],
+            ),
+            (
+                [cli.AgentHypothesis(label="credential handoff", rationale="follow credential clue", role="credential_hunter")],
+                [cli.AgentAction(kind="content_search", query="password", reason="follow credential clue", role="credential_hunter")],
+            ),
+            (
+                [cli.AgentHypothesis(label="review docs", rationale="doc trail", status="inconclusive", role="document_analyst")],
+                [
+                    cli.AgentAction(kind="dir_list", path="HR", reason="inspect hr", role="identity_reviewer"),
+                    cli.AgentAction(kind="content_search", query="vpn", reason="follow credential clue", role="credential_hunter"),
+                ],
+            ),
+        ]
+        execute_agent_actions.side_effect = [
+            (
+                [cli.AgentObservation(path="docs/a.txt", evidence="temporary password: Welkom123", source_mechanism="read_head", confidence=0.95, role="document_analyst", derived_claim="Found likely login material")],
+                [],
+            ),
+            (
+                [cli.AgentObservation(path="docs/a.txt", evidence="temporary password: Welkom123", source_mechanism="content_search", confidence=0.9, role="credential_hunter", derived_claim="Confirmed credential clue")],
+                [],
+            ),
+            (
+                [cli.AgentObservation(path="HR", evidence="employee list", source_mechanism="dir_list", confidence=0.6, role="identity_reviewer", derived_claim="Found related HR artifacts")],
+                [],
+            ),
+            (
+                [cli.AgentObservation(path="vpn.txt", evidence="vpn references", source_mechanism="content_search", confidence=0.7, role="credential_hunter", derived_claim="Found related VPN clue")],
+                [],
+            ),
+        ]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        stdout = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stdout(stdout):
+            target = Path(tmpdir)
+            (target / "docs").mkdir()
+            (target / "docs" / "a.txt").write_text("temporary password: Welkom123\n", encoding="utf-8")
+            cli.run_agent_mode(target, [], args)
+
+        rendered = stdout.getvalue()
+        self.assertIn("Coordinator scheduled next roles:", rendered)
+        self.assertIn("credential_hunter", rendered)
+        self.assertIn("identity_reviewer", rendered)
+        self.assertLess(
+            rendered.index("Executing follow-up subagent credential_hunter actions"),
+            rendered.index("Executing follow-up subagent identity_reviewer actions"),
+        )
 
 
 if __name__ == "__main__":

@@ -686,6 +686,22 @@ class IntegrationTests(unittest.TestCase):
             rendered,
         )
 
+    def test_render_terminal_report_highlights_shared_secret_value_only(self) -> None:
+        report = "\n".join(
+            [
+                "# Sensitive Report",
+                "",
+                "## Secret and Credential Findings",
+                "- [high] credential in secrets.env via pattern:shared-secret-assignment",
+                "  Evidence: `shared_secret=DeltaBlue!2024`",
+            ]
+        )
+
+        rendered = cli.render_terminal_report(report)
+
+        self.assertIn("shared_secret=", rendered)
+        self.assertIn(f"shared_secret={cli.colorize('DeltaBlue!2024', 'critical')}", rendered)
+
     def test_cli_standard_output_shows_progress_and_full_report(self) -> None:
         import subprocess
 

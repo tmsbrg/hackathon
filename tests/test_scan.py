@@ -90,6 +90,24 @@ class ScanLogicTests(unittest.TestCase):
         self.assertIn("pattern:credentials-assignment", detectors)
         self.assertIn("pattern:username-assignment", detectors)
 
+    def test_keyword_findings_detect_seeded_credential_field_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "secrets.env"
+            path.write_text(
+                "shared_secret=DeltaBlue!2024\n"
+                "client_secret=tenant-client-secret\n"
+                "pass=Welkom123\n",
+                encoding="utf-8",
+            )
+
+            findings = cli.keyword_findings(target, path, path.read_text(encoding="utf-8"))
+
+        detectors = {finding.detector for finding in findings}
+        self.assertIn("pattern:shared-secret-assignment", detectors)
+        self.assertIn("pattern:secret-assignment", detectors)
+        self.assertIn("pattern:credential-field-assignment", detectors)
+
     def test_deduplicate_findings_collapses_same_source_category_and_evidence(self) -> None:
         findings = [
             cli.Finding(
