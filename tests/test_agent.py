@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 import json
 import contextlib
+from urllib.error import URLError
 
 from doc_triage import cli
 
@@ -215,6 +216,36 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(hypotheses[0].label, "List target contents.")
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].kind, "file_info")
+
+    def test_parse_agent_plan_lines_accepts_qwen_table_shape(self) -> None:
+        payload = (
+            "hypothesis|label|rationale|status|action|kind|target_or_query|reason|limit|timeout_seconds\n"
+            "---|---|---|---|---|---|---|---|---|---\n"
+            "Potential clue in text file|ctf_case|README suggests the text file is relevant.|pending|action|read_head|ctf_cases/a/notes.txt|Inspect the file head.|10|3\n"
+        )
+
+        hypotheses, actions = cli.parse_agent_plan_lines(payload)
+
+        self.assertEqual(len(hypotheses), 1)
+        self.assertEqual(hypotheses[0].label, "ctf_case")
+        self.assertEqual(hypotheses[0].rationale, "README suggests the text file is relevant.")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "read_head")
+        self.assertEqual(actions[0].path, "ctf_cases/a/notes.txt")
+
+    def test_parse_agent_plan_lines_accepts_inline_action_segment(self) -> None:
+        payload = (
+            "ctf_cases/bad_blockchain/ctf/bad-blockchain.txt|label=Potential CTF clue|status=Active|action|"
+            "kind=read_head|path=ctf_cases/bad_blockchain/ctf/bad-blockchain.txt|"
+            "reason=Inspect the text artifact.|limit=20|timeout_seconds=5\n"
+        )
+
+        hypotheses, actions = cli.parse_agent_plan_lines(payload)
+
+        self.assertEqual(hypotheses, [])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "read_head")
+        self.assertEqual(actions[0].path, "ctf_cases/bad_blockchain/ctf/bad-blockchain.txt")
 
     def test_merge_agent_actions_backfills_with_fallback(self) -> None:
         merged = cli.merge_agent_actions(
@@ -491,6 +522,26 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 1)
         self.assertEqual(hypotheses[0].label, "Investigate Elliot stash")
         self.assertEqual(actions[0].kind, "dir_list")
+
+    @mock.patch("doc_triage.cli.urlopen", side_effect=URLError(ConnectionRefusedError(111, "Connection refused")))
+    def test_request_agent_plan_surfaces_ollama_unavailable(self, _: mock.Mock) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Ollama unavailable: connection refused"):
+            cli.request_agent_plan(
+                "http://127.0.0.1:11434",
+                "qwen3:8b",
+                {"instructions": ["Return hypotheses and actions"]},
+                model_retries=2,
+            )
+
+    @mock.patch("doc_triage.cli.urlopen", side_effect=URLError(PermissionError(1, "Operation not permitted")))
+    def test_request_agent_summary_surfaces_ollama_permission_denied(self, _: mock.Mock) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Ollama unavailable: local Ollama access was denied"):
+            cli.request_agent_summary(
+                "http://127.0.0.1:11434",
+                "qwen3:8b",
+                {"instructions": ["Return executive_summary, priority_findings, relationships, review_order"]},
+                model_retries=1,
+            )
 
     @mock.patch("doc_triage.cli.urlopen")
     def test_request_agent_summary_repairs_non_json_response_once(self, urlopen: mock.Mock) -> None:

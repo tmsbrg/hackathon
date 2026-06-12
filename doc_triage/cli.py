@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import errno
 import hashlib
 import json
 import mimetypes
@@ -447,9 +448,47 @@ def request_structured_json(
 
     if isinstance(parsed, dict) and required_keys.issubset(parsed):
         return parsed
+    if last_error is not None and is_ollama_transport_error(last_error):
+        raise RuntimeError(f"Ollama unavailable: {describe_ollama_transport_error(last_error)}") from last_error
     if attempt > 0 and last_error is not None:
         raise RuntimeError(f"Ollama response repair failed: {last_error}") from last_error
     raise RuntimeError("Ollama response did not include the required JSON keys.")
+
+
+def is_ollama_transport_error(error: Exception) -> bool:
+    if isinstance(error, TimeoutError):
+        return True
+    if not isinstance(error, URLError):
+        return False
+    reason = getattr(error, "reason", None)
+    if isinstance(reason, TimeoutError):
+        return True
+    if isinstance(reason, OSError):
+        return True
+    return False
+
+
+def describe_ollama_transport_error(error: Exception) -> str:
+    if isinstance(error, TimeoutError):
+        return "request timed out"
+    if isinstance(error, URLError):
+        reason = getattr(error, "reason", None)
+        if isinstance(reason, TimeoutError):
+            return "request timed out"
+        if isinstance(reason, PermissionError):
+            return "local Ollama access was denied"
+        if isinstance(reason, ConnectionRefusedError):
+            return "connection refused at the configured Ollama URL"
+        if isinstance(reason, OSError):
+            if reason.errno == errno.ECONNREFUSED:
+                return "connection refused at the configured Ollama URL"
+            if reason.errno == errno.EPERM:
+                return "local Ollama access was denied"
+            if reason.strerror:
+                return reason.strerror
+        if reason:
+            return str(reason)
+    return str(error)
 
 
 def build_llm_recon_context(target: Path, findings: list[Finding], max_files: int) -> dict[str, object]:
@@ -665,6 +704,9 @@ def normalize_agent_plan_payload(payload: dict[str, object]) -> dict[str, object
 
 
 def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[AgentAction]]:
+    def _normalize_cell(value: str) -> str:
+        return value.strip().strip("`").strip()
+
     def _parse_kv_parts(parts: list[str]) -> dict[str, str]:
         mapping: dict[str, str] = {}
         for part in parts[1:]:
@@ -681,6 +723,7 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
         stripped = value.strip()
         if stripped.startswith(prefix):
             stripped = stripped[len(prefix) :]
+        stripped = stripped.rstrip(".")
         try:
             return int(stripped)
         except ValueError:
@@ -697,49 +740,122 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
             return "zip_list"
         return ""
 
+    def _is_separator_line(parts: list[str]) -> bool:
+        if not parts:
+            return True
+        return all(set(part.strip()) <= {"-"} for part in parts if part.strip())
+
+    def _parse_action_fields(fields: dict[str, str]) -> list[AgentAction]:
+        kind = _normalize_cell(fields.get("kind", ""))
+        target_value = _normalize_cell(
+            fields.get("target_or_query", "") or fields.get("path", "") or fields.get("query", "") or "."
+        )
+        reason = fields.get("reason", "").strip() or f"Investigate {target_value} via {kind}."
+        limit = _parse_numeric(_normalize_cell(fields.get("limit", "20")), "", 20)
+        timeout_seconds = _parse_numeric(_normalize_cell(fields.get("timeout_seconds", "0")), "", 0)
+        payload_item = {
+            "kind": kind,
+            "reason": reason,
+            "limit": limit,
+            "timeout_seconds": timeout_seconds,
+        }
+        if kind in {"content_search", "filename_search"}:
+            payload_item["query"] = target_value
+        else:
+            payload_item["path"] = target_value
+        return parse_agent_actions([payload_item])
+
+    def _parse_hypothesis_fields(fields: dict[str, str]) -> AgentHypothesis | None:
+        label = fields.get("label", "").strip()
+        rationale = fields.get("rationale", "").strip()
+        status = fields.get("status", "inconclusive").strip() or "inconclusive"
+        if label and rationale:
+            return AgentHypothesis(label=label, rationale=rationale, status=status)
+        return None
+
     hypotheses: list[AgentHypothesis] = []
     actions: list[AgentAction] = []
+    table_header: list[str] | None = None
     for raw_line in payload.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = [part.strip() for part in line.split("|")]
+        if line.startswith("|"):
+            line = line[1:]
+        if line.endswith("|"):
+            line = line[:-1]
+        parts = [_normalize_cell(part) for part in line.split("|")]
         record_type = parts[0].lower()
         if record_type.startswith("---"):
             continue
+        if _is_separator_line(parts):
+            continue
+        header_candidate = [part.lower() for part in parts]
+        if "action" in header_candidate and "kind" in header_candidate and "target_or_query" in header_candidate:
+            table_header = header_candidate
+            continue
+        if table_header is not None and len(parts) == len(table_header):
+            fields = dict(zip(table_header, parts, strict=False))
+            if fields.get("label") and fields.get("rationale"):
+                hypotheses.append(
+                    AgentHypothesis(
+                        label=fields["label"],
+                        rationale=fields["rationale"],
+                        status=fields.get("status", "inconclusive") or "inconclusive",
+                    )
+                )
+            actions.extend(
+                _parse_action_fields(
+                    {
+                        "kind": fields.get("kind", ""),
+                        "target_or_query": fields.get("target_or_query", ""),
+                        "reason": fields.get("reason", ""),
+                        "limit": fields.get("limit", "20"),
+                        "timeout_seconds": fields.get("timeout_seconds", "0"),
+                    }
+                )
+            )
+            continue
+        if any(token == "action" for token in parts[1:]):
+            action_index = parts.index("action")
+            prefix_fields = parts[:action_index]
+            action_fields = parts[action_index:]
+            if len(prefix_fields) >= 3 and prefix_fields[1].lower() == "label":
+                hypotheses.append(
+                    AgentHypothesis(
+                        label=prefix_fields[0],
+                        rationale=prefix_fields[2] if len(prefix_fields) >= 3 else prefix_fields[0],
+                        status=prefix_fields[1] if len(prefix_fields) >= 2 else "inconclusive",
+                    )
+                )
+            elif len(prefix_fields) >= 2 and prefix_fields[1].startswith("label="):
+                kv = _parse_kv_parts(["hypothesis", *prefix_fields[1:]])
+                hypothesis = _parse_hypothesis_fields(kv)
+                if hypothesis is not None:
+                    hypotheses.append(hypothesis)
+            if len(action_fields) >= 2:
+                parts = action_fields
+                record_type = parts[0].lower()
         if record_type in AGENT_ACTION_KINDS:
             kv = _parse_kv_parts(parts)
             if "target_or_query" in kv or "path" in kv or "query" in kv:
-                target_value = kv.get("target_or_query") or kv.get("path") or kv.get("query") or "."
-                reason = kv.get("reason") or kv.get("label") or f"Investigate {target_value} via {record_type}."
-                limit = _parse_numeric(kv.get("limit", "20"), "", 20)
-                timeout_seconds = _parse_numeric(kv.get("timeout_seconds", "0"), "", 0)
-                payload_item = {
-                    "kind": kv.get("kind") or record_type,
-                    "reason": reason,
-                    "limit": limit,
-                    "timeout_seconds": timeout_seconds,
-                }
-                if record_type in {"content_search", "filename_search"}:
-                    payload_item["query"] = target_value
-                else:
-                    payload_item["path"] = target_value
-                actions.extend(parse_agent_actions([payload_item]))
+                kv["kind"] = kv.get("kind") or record_type
+                if "target_or_query" not in kv:
+                    kv["target_or_query"] = kv.get("path") or kv.get("query") or "."
+                if "reason" not in kv and kv.get("label"):
+                    kv["reason"] = kv["label"]
+                actions.extend(_parse_action_fields(kv))
                 continue
-            label = kv.get("label", "").strip()
-            rationale = kv.get("rationale", "").strip()
-            status = kv.get("status", "inconclusive").strip() or "inconclusive"
-            if label and rationale:
-                hypotheses.append(AgentHypothesis(label=label, rationale=rationale, status=status))
+            hypothesis = _parse_hypothesis_fields(kv)
+            if hypothesis is not None:
+                hypotheses.append(hypothesis)
                 continue
         if record_type == "hypothesis":
             kv = _parse_kv_parts(parts)
             if kv:
-                label = kv.get("label", "").strip()
-                rationale = kv.get("rationale", "").strip()
-                status = kv.get("status", "inconclusive").strip() or "inconclusive"
-                if label and rationale:
-                    hypotheses.append(AgentHypothesis(label=label, rationale=rationale, status=status))
+                hypothesis = _parse_hypothesis_fields(kv)
+                if hypothesis is not None:
+                    hypotheses.append(hypothesis)
                 continue
         if record_type.startswith("hyp_") and len(parts) >= 6:
             label = parts[2] or parts[1]
@@ -801,38 +917,23 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
         if record_type == "action":
             kv = _parse_kv_parts(parts)
             if kv:
-                kind = kv.get("kind", "")
-                target_value = kv.get("target_or_query") or kv.get("path") or kv.get("query") or "."
-                reason = kv.get("reason", "") or f"Investigate {target_value} via {kind}."
-                limit = _parse_numeric(kv.get("limit", "20"), "", 20)
-                timeout_seconds = _parse_numeric(kv.get("timeout_seconds", "0"), "", 0)
-                payload_item = {
-                    "kind": kind,
-                    "reason": reason,
-                    "limit": limit,
-                    "timeout_seconds": timeout_seconds,
-                }
-                if kind in {"content_search", "filename_search"}:
-                    payload_item["query"] = target_value
-                else:
-                    payload_item["path"] = target_value
-                actions.extend(parse_agent_actions([payload_item]))
+                actions.extend(_parse_action_fields(kv))
                 continue
         if record_type != "action" or len(parts) < 4:
             continue
-        kind = parts[1]
-        target_value = parts[2]
+        kind = _normalize_cell(parts[1])
+        target_value = _normalize_cell(parts[2])
         reason = parts[3]
         limit = 20
         timeout_seconds = 0
         if len(parts) >= 5:
             try:
-                limit = int(parts[4])
+                limit = int(_normalize_cell(parts[4]))
             except ValueError:
                 limit = 20
         if len(parts) >= 6:
             try:
-                timeout_seconds = int(parts[5])
+                timeout_seconds = int(_normalize_cell(parts[5]))
             except ValueError:
                 timeout_seconds = 0
         if kind in {"content_search", "filename_search"}:
@@ -1808,6 +1909,10 @@ def request_agent_plan(
             last_error = RuntimeError("Ollama response did not include usable agent actions.")
         except Exception as exc:
             last_error = exc
+            if is_ollama_transport_error(exc):
+                break
+    if last_error is not None and is_ollama_transport_error(last_error):
+        raise RuntimeError(f"Ollama unavailable: {describe_ollama_transport_error(last_error)}") from last_error
     raise RuntimeError(f"Ollama response repair failed: {last_error}")
 
 

@@ -47,9 +47,10 @@ def colorize(label: str, color: str) -> str:
 
 
 def safe_relative_path(target: Path, relative_path: str) -> Path | None:
-    candidate = (target / relative_path).resolve()
+    target_root = target.resolve()
+    candidate = (target_root / relative_path).resolve()
     try:
-        candidate.relative_to(target)
+        candidate.relative_to(target_root)
     except ValueError:
         return None
     return candidate
