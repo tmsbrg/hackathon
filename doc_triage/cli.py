@@ -1014,6 +1014,77 @@ def deduplicate_agent_actions(actions: list[AgentAction]) -> list[AgentAction]:
     return deduped
 
 
+def build_fallback_agent_plan(
+    target: Path,
+    findings: list[Finding],
+    recon: dict[str, object],
+    action_budget: int,
+) -> tuple[list[AgentHypothesis], list[AgentAction]]:
+    hypotheses: list[AgentHypothesis] = []
+    actions: list[AgentAction] = []
+    if findings:
+        top_finding = findings[0]
+        hypotheses.append(
+            AgentHypothesis(
+                label=f"Review supporting context for {top_finding.source}",
+                rationale=f"The deterministic scanner flagged {top_finding.category} in {top_finding.source}.",
+            )
+        )
+        actions.append(
+            AgentAction(
+                kind="read_head",
+                path=top_finding.source,
+                reason="Inspect the surrounding document context for the top deterministic finding.",
+                limit=25,
+            )
+        )
+    top_directories = recon.get("top_directories")
+    if isinstance(top_directories, list) and top_directories:
+        directory = top_directories[0]
+        if isinstance(directory, dict) and isinstance(directory.get("path"), str):
+            actions.append(
+                AgentAction(
+                    kind="dir_list",
+                    path=directory["path"],
+                    reason="Survey the densest directory in the dataset.",
+                    limit=25,
+                )
+            )
+    representative_heads = recon.get("representative_heads")
+    if isinstance(representative_heads, list):
+        for item in representative_heads[:3]:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+            actions.append(
+                AgentAction(
+                    kind="read_head",
+                    path=path,
+                    reason="Inspect a representative file from the dataset profile.",
+                    limit=20,
+                )
+            )
+    if findings:
+        query_terms = {"cookie", "session", "token", "password", "key"}
+        for finding in findings[:3]:
+            evidence = finding.evidence.lower()
+            for term in query_terms:
+                if term in evidence:
+                    actions.append(
+                        AgentAction(
+                            kind="content_search",
+                            reason=f"Look for related {term} references elsewhere in the share.",
+                            query=term,
+                            limit=10,
+                        )
+                    )
+                    break
+    deduped = deduplicate_agent_actions(actions)[:action_budget]
+    return hypotheses, deduped
+
+
 def normalize_agent_observation(
     path: str,
     evidence: str,
@@ -1503,7 +1574,14 @@ def run_agent_mode(
     except Exception as exc:
         return AgentRun(warnings=[f"agent planning failed: {exc}"], sandbox_available=shutil.which("bwrap") is not None)
 
-    actions = deduplicate_agent_actions(planned_actions)[: args.agent_max_actions]
+    fallback_hypotheses, fallback_actions = build_fallback_agent_plan(target, findings, recon, args.agent_max_actions)
+    if not hypotheses:
+        hypotheses = fallback_hypotheses
+    actions = deduplicate_agent_actions(planned_actions)
+    if not actions:
+        warnings.append("agent planner returned no executable actions; using fallback action set")
+        actions = fallback_actions
+    actions = actions[: args.agent_max_actions]
     observations, action_warnings = execute_agent_actions(target, actions, args.agent_timeout)
     warnings.extend(action_warnings)
 
@@ -1529,7 +1607,7 @@ def run_agent_mode(
         refined_hypotheses, refined_actions = hypotheses, []
         warnings.append(f"agent refinement failed: {exc}")
 
-    all_hypotheses = hypotheses or refined_hypotheses
+    all_hypotheses = hypotheses or refined_hypotheses or fallback_hypotheses
     remaining_budget = max(0, args.agent_max_actions - len(actions))
     second_batch = []
     if remaining_budget > 0:

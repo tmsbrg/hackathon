@@ -38,6 +38,17 @@ Run with OCR and Ollama:
 doc-triage scan /path/to/share --output report.md --ocr --model huihui_ai/qwen3.5-abliterated:9b
 ```
 
+Run the new agentic mode, which profiles the dataset, chooses context-specific follow-up reads/searches, and adds agent provenance to the report:
+
+```bash
+doc-triage --verbose scan /path/to/share \
+  --output report.md \
+  --model huihui_ai/qwen3.5-abliterated:9b \
+  --agent \
+  --agent-max-actions 8 \
+  --agent-timeout 30
+```
+
 Exclude noisy paths:
 
 ```bash
@@ -112,6 +123,12 @@ Scan with OCR and a local model:
 doc-triage scan /mnt/share --output report.md --ocr --model huihui_ai/qwen3.5-abliterated:9b
 ```
 
+Scan with the agent loop enabled:
+
+```bash
+doc-triage --verbose scan /mnt/share --output report.md --agent --model huihui_ai/qwen3.5-abliterated:9b
+```
+
 ## Report shape
 
 Every report includes:
@@ -124,6 +141,13 @@ Every report includes:
 6. Personal and financial findings
 7. Interesting document relationships
 8. Files to review first
+
+When `--agent` is enabled the report also adds:
+
+9. Agent investigation plan
+10. Agent observations
+11. Rejected hypotheses
+12. Agent coverage and limitations
 
 ## Ollama setup
 

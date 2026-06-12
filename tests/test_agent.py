@@ -74,6 +74,30 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(deduped), 2)
         self.assertEqual(deduped[0].reason, "first")
 
+    def test_build_fallback_agent_plan_uses_findings_and_representative_files(self) -> None:
+        recon = {
+            "top_directories": [{"path": "docs", "count": 4}],
+            "representative_heads": [{"path": "docs/a.txt", "preview": "hello"}],
+        }
+        findings = [
+            cli.Finding(
+                source="loot.txt",
+                category="credential",
+                severity="high",
+                detector="built-in",
+                evidence="session token=abc",
+                line=1,
+                confidence=0.9,
+                metadata={},
+            )
+        ]
+
+        hypotheses, actions = cli.build_fallback_agent_plan(Path("/tmp/case"), findings, recon, action_budget=5)
+
+        self.assertTrue(hypotheses)
+        self.assertTrue(any(action.kind == "content_search" for action in actions))
+        self.assertTrue(any(action.path == "loot.txt" for action in actions))
+
     @mock.patch("doc_triage.cli.run_command")
     def test_execute_agent_actions_normalizes_content_search_results(self, run_command: mock.Mock) -> None:
         run_command.return_value = cli.CommandResult(
@@ -101,6 +125,22 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertTrue(errors)
         self.assertIn("subprocess", " ".join(errors))
+
+    @mock.patch("doc_triage.cli.shutil.which", return_value=None)
+    def test_execute_generated_helper_warns_when_bwrap_missing(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            observations, warnings = cli.execute_generated_helper(
+                Path(tmpdir),
+                cli.AgentAction(
+                    kind="generated_python_helper",
+                    reason="inspect",
+                    code='print("{\\"path\\": \\"a.txt\\", \\"evidence\\": \\"x\\"}")\n',
+                ),
+                timeout_seconds=5,
+            )
+
+        self.assertEqual(observations, [])
+        self.assertIn("generated helpers skipped", " ".join(warnings))
 
     def test_render_report_includes_agent_sections(self) -> None:
         args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
