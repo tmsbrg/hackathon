@@ -417,6 +417,32 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(any("VPN token reuse" in item.notes for item in hypotheses))
         self.assertTrue(any(action.role == "credential_hunter" and action.hypothesis_label == "VPN token reuse" for action in actions))
 
+    def test_build_cross_role_handoff_plan_branches_shared_finance_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "Finance" / "payroll.txt"
+            path.parent.mkdir(parents=True)
+            path.write_text("salary bands and iban references for employees\n", encoding="utf-8")
+            observations = [
+                cli.AgentObservation(
+                    path="Finance/payroll.txt",
+                    evidence="salary bands and iban references for employees",
+                    source_mechanism="read_head",
+                    confidence=0.91,
+                    role="document_analyst",
+                    derived_claim="Found payroll and IBAN material",
+                )
+            ]
+
+            hypotheses, actions, notes = cli.build_cross_role_handoff_plan(target, observations, [], 8)
+
+        identity_labels = {item.label for item in hypotheses if item.role == "identity_reviewer"}
+        self.assertIn("Payroll records", identity_labels)
+        self.assertIn("IBAN exposure", identity_labels)
+        self.assertTrue(any(action.role == "identity_reviewer" and action.path == "Finance/payroll.txt" for action in actions))
+        self.assertTrue(any(action.role == "identity_reviewer" and action.query == "iban|account|bank" for action in actions))
+        self.assertTrue(any("identity_reviewer" in note for note in notes))
+
     @mock.patch("doc_triage.cli.request_agent_plan")
     def test_plan_cross_role_replans_requests_role_specific_replan(self, request_agent_plan: mock.Mock) -> None:
         request_agent_plan.return_value = (
@@ -1888,6 +1914,10 @@ class AgentModeTests(unittest.TestCase):
                         derived_claim="Credential hunter confirmed login material",
                     )
                 ],
+                [],
+            ),
+            (
+                [],
                 [],
             ),
         ]

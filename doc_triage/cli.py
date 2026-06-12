@@ -316,15 +316,148 @@ def infer_observation_handoff_targets(observation: AgentObservation) -> list[tup
     return deduped
 
 
+def infer_handoff_hypotheses_for_role(
+    observation: AgentObservation,
+    source_role: str,
+    target_role: str,
+    reason: str,
+) -> list[AgentHypothesis]:
+    combined = " ".join(
+        part for part in (observation.path, observation.evidence, observation.derived_claim, observation.source_mechanism) if part
+    ).lower()
+    hypotheses: list[AgentHypothesis] = []
+    seen: set[tuple[str, str]] = set()
+    seen_labels: set[str] = set()
+
+    def _append(label: str, rationale: str, note: str) -> None:
+        normalized_label = label.strip().lower()
+        if normalized_label in seen_labels:
+            return
+        key = (label, rationale)
+        if key in seen:
+            return
+        seen.add(key)
+        seen_labels.add(normalized_label)
+        hypotheses.append(
+            AgentHypothesis(
+                label=label,
+                rationale=rationale,
+                status="inconclusive",
+                role=target_role,
+                evidence_paths=[observation.path],
+                notes=note,
+            )
+        )
+
+    if observation.hypothesis_label:
+        _append(
+            observation.hypothesis_label.strip(),
+            f"{reason} Continue testing the originating hypothesis across subagents.",
+            f"Spawned from observation by {source_role} while testing hypothesis '{observation.hypothesis_label}'.",
+        )
+
+    if target_role == "credential_hunter":
+        if any(token in combined for token in ("password", "passwd", "wachtwoord", "credential", "welkom123")):
+            _append(
+                f"Credential reuse around {observation.path}",
+                "Observed likely password or credential material that may support reuse or direct access.",
+                f"Spawned from observation by {source_role}.",
+            )
+        if any(token in combined for token in ("token", "cookie", "bearer", "session", "vpn", "login")):
+            _append(
+                "VPN token reuse" if "vpn" in combined else f"Session token exposure in {observation.path}",
+                "Observed token or login material that may indicate reusable access artifacts.",
+                f"Spawned from observation by {source_role}.",
+            )
+    elif target_role == "identity_reviewer":
+        if any(token in combined for token in ("payroll", "salary", "employee", "personnel", "hr")):
+            _append(
+                "Payroll records",
+                "Observed payroll or employee context that may contain identity-bearing records.",
+                f"Spawned from observation by {source_role}.",
+            )
+        if any(token in combined for token in ("iban", "account", "bank")):
+            _append(
+                "IBAN exposure",
+                "Observed financial account context that may expose bank or payment identifiers.",
+                f"Spawned from observation by {source_role}.",
+            )
+        if any(token in combined for token in ("bsn", "citizen", "burgerservicenummer", "identity")):
+            _append(
+                "Identity records",
+                "Observed identity-specific context that may expose regulated personal identifiers.",
+                f"Spawned from observation by {source_role}.",
+            )
+    elif target_role == "infra_config_reviewer":
+        if any(token in combined for token in ("config", "json", "yaml", "xml", "ini")):
+            _append(
+                "Config exposure",
+                "Observed configuration material that may contain operational or secret-bearing settings.",
+                f"Spawned from observation by {source_role}.",
+            )
+        if any(token in combined for token in ("service", "endpoint", "host", "hostname", "url")):
+            _append(
+                "Service exposure",
+                "Observed service metadata that may reveal operational entry points or dependencies.",
+                f"Spawned from observation by {source_role}.",
+            )
+        if any(token in combined for token in ("docker", "kube", "terraform", "cluster")):
+            _append(
+                "Infrastructure material",
+                "Observed infrastructure markers that may reveal deployment or orchestration details.",
+                f"Spawned from observation by {source_role}.",
+            )
+    elif target_role == "archive_analyst":
+        if any(token in combined for token in ("zip", "archive", "backup", "attachment", ".tar", ".7z")):
+            _append(
+                "Archive lead",
+                "Observed a packaged artifact that may contain nested documents or secrets.",
+                f"Spawned from observation by {source_role}.",
+            )
+    elif target_role == "document_analyst":
+        _append(
+            f"Document context around {observation.path}",
+            "Observed metadata or artifact context that warrants direct document review.",
+            f"Spawned from observation by {source_role}.",
+        )
+
+    if not hypotheses:
+        fallback_label = observation.hypothesis_label.strip() or f"Handoff from {source_role} for {observation.path}"
+        _append(
+            fallback_label,
+            reason,
+            f"Spawned from observation by {source_role}.",
+        )
+    return hypotheses
+
+
 def _handoff_action_for_observation(
     target: Path,
     observation: AgentObservation,
+    hypothesis: AgentHypothesis,
     target_role: str,
     reason: str,
 ) -> AgentAction | None:
     source_path = observation.path.strip()
     resolved = resolve_agent_action_path(target, source_path) if source_path else None
+    label = hypothesis.label.lower()
     if target_role == "credential_hunter":
+        if "token" in label or "vpn" in label or "session" in label:
+            return AgentAction(
+                kind="content_search",
+                query="token|vpn|session|login",
+                reason=f"{reason} Test the token-centric credential hypothesis from {observation.path}.",
+                role=target_role,
+                limit=10,
+            )
+        if "credential reuse" in label:
+            return AgentAction(
+                kind="content_search",
+                query="password|credential|login",
+                reason=f"{reason} Test the credential reuse hypothesis from {observation.path}.",
+                role=target_role,
+                limit=10,
+            )
         for candidate in ("password", "token", "secret", "cookie", "login", "credential"):
             if candidate in observation.evidence.lower() or candidate in observation.derived_claim.lower():
                 return AgentAction(
@@ -343,6 +476,22 @@ def _handoff_action_for_observation(
                 limit=20,
             )
     if target_role == "identity_reviewer":
+        if "iban" in label:
+            return AgentAction(
+                kind="content_search",
+                query="iban|account|bank",
+                reason=f"{reason} Test the financial identifier hypothesis from {observation.path}.",
+                role=target_role,
+                limit=10,
+            )
+        if "identity records" in label:
+            return AgentAction(
+                kind="content_search",
+                query="bsn|burgerservicenummer|citizen|identity",
+                reason=f"{reason} Test the personal identifier hypothesis from {observation.path}.",
+                role=target_role,
+                limit=10,
+            )
         if resolved is not None and resolved.is_file():
             return AgentAction(
                 kind="read_head",
@@ -360,6 +509,14 @@ def _handoff_action_for_observation(
                 limit=20,
             )
     if target_role == "infra_config_reviewer":
+        if "service exposure" in label:
+            return AgentAction(
+                kind="content_search",
+                query="service|endpoint|host|url",
+                reason=f"{reason} Search for adjacent service markers.",
+                role=target_role,
+                limit=10,
+            )
         if resolved is not None and resolved.is_file():
             target_kind = classify_agent_target(resolved)
             action_kind = "read_head" if target_kind == "text" else "file_info"
@@ -423,40 +580,30 @@ def build_cross_role_handoff_plan(
         if len(actions) >= action_budget:
             break
         source_role = observation.role.strip() or infer_agent_role(observation.derived_claim, source=observation.path)
-        base_label = observation.hypothesis_label.strip() or f"Handoff from {source_role} for {observation.path}"
         for target_role, reason in infer_observation_handoff_targets(observation):
-            if len(actions) >= action_budget:
-                break
-            hypothesis = AgentHypothesis(
-                label=base_label,
-                rationale=(
-                    f"{reason} Source subagent {source_role} observed {observation.path}."
-                    if observation.hypothesis_label
-                    else reason
-                ),
-                status="inconclusive",
-                role=target_role,
-                evidence_paths=[observation.path],
-                notes=(
-                    f"Spawned from observation by {source_role} while testing hypothesis '{observation.hypothesis_label}'."
-                    if observation.hypothesis_label
-                    else f"Spawned from observation by {source_role}."
-                ),
-            )
-            hypothesis_key = (hypothesis.role, hypothesis.label, hypothesis.rationale)
-            if hypothesis_key not in hypothesis_keys:
-                hypothesis_keys.add(hypothesis_key)
-                hypotheses.append(hypothesis)
-            action = _handoff_action_for_observation(target, observation, target_role, reason)
-            if action is None:
-                continue
-            action.hypothesis_label = observation.hypothesis_label.strip() or hypothesis.label
-            action_key = (action.kind, action.path, action.query, hashlib.sha256(action.code.encode("utf-8")).hexdigest())
-            if action_key in existing_keys:
-                continue
-            existing_keys.add(action_key)
-            actions.append(action)
-            notes.append(f"{source_role} -> {target_role} via {observation.path}")
+            for hypothesis in infer_handoff_hypotheses_for_role(observation, source_role, target_role, reason):
+                if len(actions) >= action_budget:
+                    break
+                hypothesis_key = (hypothesis.role, hypothesis.label, hypothesis.rationale)
+                if hypothesis_key not in hypothesis_keys:
+                    hypothesis_keys.add(hypothesis_key)
+                    hypotheses.append(hypothesis)
+                action = _handoff_action_for_observation(target, observation, hypothesis, target_role, reason)
+                if action is None:
+                    continue
+                action.hypothesis_label = hypothesis.label
+                action_key = (
+                    action.kind,
+                    action.path,
+                    action.query,
+                    action.hypothesis_label,
+                    hashlib.sha256(action.code.encode("utf-8")).hexdigest(),
+                )
+                if action_key in existing_keys:
+                    continue
+                existing_keys.add(action_key)
+                actions.append(action)
+                notes.append(f"{source_role} -> {target_role} via {observation.path} [{action.hypothesis_label}]")
     return hypotheses, deduplicate_agent_actions(actions)[:action_budget], notes[:action_budget]
 
 
