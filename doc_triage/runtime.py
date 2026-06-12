@@ -28,6 +28,8 @@ def progress_log(enabled: bool, stage: str, message: str) -> None:
 
 def summarize_agent_action(action: AgentAction) -> str:
     target = action.query or action.path
+    if action.hypothesis_label:
+        return f"{action.kind}({target})[{action.hypothesis_label}]"
     return f"{action.kind}({target})"
 
 

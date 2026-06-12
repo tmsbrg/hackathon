@@ -54,6 +54,7 @@ class AgentAction:
     kind: str
     reason: str
     role: str = ""
+    hypothesis_label: str = ""
     path: str = "."
     query: str = ""
     limit: int = 20
@@ -68,6 +69,7 @@ class AgentObservation:
     source_mechanism: str
     confidence: float
     role: str = ""
+    hypothesis_label: str = ""
     derived_claim: str = ""
     action_kind: str = ""
     exit_status: int = 0

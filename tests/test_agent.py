@@ -185,6 +185,14 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(actions[0].limit, 7)
         self.assertEqual(actions[0].role, "document_analyst")
 
+    def test_parse_agent_actions_accepts_hypothesis_label(self) -> None:
+        actions = cli.parse_agent_actions(
+            [{"kind": "content_search", "query": "vpn", "reason": "test token reuse", "role": "credential_hunter", "hypothesis_label": "VPN token reuse"}]
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].hypothesis_label, "VPN token reuse")
+
     def test_parse_agent_plan_lines_accepts_role_annotated_records(self) -> None:
         hypotheses, actions = cli.parse_agent_plan_lines(
             "hypothesis|VPN creds nearby|Helpdesk email suggests access reuse|inconclusive|credential_hunter\n"
@@ -446,6 +454,22 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertEqual(updated[0].status, "confirmed")
         self.assertIn("docs/a.txt", updated[0].evidence_paths)
+
+    def test_hypothesis_support_score_prefers_direct_hypothesis_link(self) -> None:
+        hypothesis = cli.AgentHypothesis(label="VPN token reuse", rationale="Helpdesk email mentions login tokens", role="credential_hunter")
+        observation = cli.AgentObservation(
+            path="vpn.txt",
+            evidence="unrelated text",
+            source_mechanism="content_search",
+            confidence=0.3,
+            role="credential_hunter",
+            hypothesis_label="VPN token reuse",
+            derived_claim="Low-context result",
+        )
+
+        score = cli.hypothesis_support_score(hypothesis, observation)
+
+        self.assertGreaterEqual(score, 4)
 
     def test_prioritize_roles_for_followup_prefers_inconclusive_hypotheses_with_strong_observations(self) -> None:
         hypotheses = [
@@ -791,6 +815,22 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(observations[0].path, "alpha.txt")
         self.assertEqual(observations[0].source_mechanism, "content_search")
         self.assertEqual(observations[0].metadata["timeout_seconds"], "5")
+        self.assertEqual(observations[0].hypothesis_label, "")
+
+    def test_execute_agent_actions_propagates_hypothesis_label_to_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "vpn.txt"
+            path.write_text("vpn token reset instructions\n", encoding="utf-8")
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="read_head", path="vpn.txt", reason="inspect vpn clue", role="credential_hunter", hypothesis_label="VPN token reuse")],
+                per_action_timeout=5,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].hypothesis_label, "VPN token reuse")
 
     @mock.patch("doc_triage.cli.run_command")
     def test_execute_agent_actions_uses_individual_timeout_override(self, run_command: mock.Mock) -> None:
