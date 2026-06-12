@@ -259,13 +259,21 @@ class AgentModeTests(unittest.TestCase):
 
     @mock.patch("doc_triage.cli.request_agent_plan")
     def test_plan_hypothesis_fanout_actions_adds_unique_actions(self, request_agent_plan: mock.Mock) -> None:
-        request_agent_plan.return_value = (
-            [cli.AgentHypothesis(label="archive lead", rationale="Check archives", role="archive_analyst")],
-            [
-                cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="Inspect archive", role="archive_analyst"),
-                cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="duplicate", role="archive_analyst"),
-            ],
-        )
+        request_agent_plan.side_effect = [
+            (
+                [cli.AgentHypothesis(label="archive lead", rationale="Check archives", role="archive_analyst")],
+                [
+                    cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="Inspect archive", role="archive_analyst"),
+                    cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="duplicate", role="archive_analyst"),
+                ],
+            ),
+            (
+                [],
+                [
+                    cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="Inspect archive again", role="archive_analyst"),
+                ],
+            ),
+        ]
         args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
         hypotheses = [cli.AgentHypothesis(label="archive lead", rationale="Check archives", role="archive_analyst")]
         existing = [cli.AgentAction(kind="dir_list", path="Archives", reason="Survey archives")]
@@ -285,12 +293,15 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(actions[0].kind, "zip_list")
         self.assertEqual(actions[0].role, "archive_analyst")
         self.assertEqual(focused_hypotheses, [])
+        self.assertEqual(request_agent_plan.call_count, 2)
 
     @mock.patch("doc_triage.cli.request_agent_plan")
     def test_plan_hypothesis_fanout_actions_groups_hypotheses_by_role(self, request_agent_plan: mock.Mock) -> None:
         request_agent_plan.side_effect = [
             ([], [cli.AgentAction(kind="content_search", query="token", reason="hunt token reuse", role="credential_hunter")]),
+            ([], [cli.AgentAction(kind="content_search", query="vpn", reason="verify token reuse", role="credential_hunter")]),
             ([], [cli.AgentAction(kind="dir_list", path="HR", reason="inspect HR docs", role="identity_reviewer")]),
+            ([], [cli.AgentAction(kind="read_head", path="Finance/payroll.xlsx", reason="inspect payroll clue", role="identity_reviewer")]),
         ]
         args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
         hypotheses = [
@@ -309,8 +320,45 @@ class AgentModeTests(unittest.TestCase):
         )
 
         self.assertEqual(warnings, [])
-        self.assertEqual(request_agent_plan.call_count, 2)
+        self.assertEqual(request_agent_plan.call_count, 4)
         self.assertEqual({action.role for action in actions}, {"credential_hunter", "identity_reviewer"})
+
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    def test_plan_hypothesis_fanout_actions_adds_targeted_hypothesis_checks(self, request_agent_plan: mock.Mock) -> None:
+        request_agent_plan.side_effect = [
+            (
+                [],
+                [cli.AgentAction(kind="dir_list", path="HR", reason="survey hr", role="identity_reviewer")],
+            ),
+            (
+                [],
+                [cli.AgentAction(kind="read_head", path="HR/payroll.txt", reason="test payroll hypothesis", role="identity_reviewer")],
+            ),
+            (
+                [],
+                [cli.AgentAction(kind="content_search", query="iban", reason="test iban hypothesis", role="identity_reviewer")],
+            ),
+        ]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        hypotheses = [
+            cli.AgentHypothesis(label="Payroll records", rationale="HR material may hold identifiers", role="identity_reviewer"),
+            cli.AgentHypothesis(label="IBAN exposure", rationale="Finance docs may expose account identifiers", role="identity_reviewer"),
+        ]
+
+        _, actions, warnings = cli.plan_hypothesis_fanout_actions(
+            Path("/tmp/case"),
+            {"representative_heads": []},
+            [],
+            [],
+            hypotheses,
+            [],
+            args,
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(request_agent_plan.call_count, 3)
+        self.assertTrue(any(action.path == "HR/payroll.txt" for action in actions))
+        self.assertTrue(any(action.query == "iban" for action in actions))
 
     def test_build_cross_role_handoff_plan_spawns_followup_role_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1748,6 +1796,14 @@ class AgentModeTests(unittest.TestCase):
                 [cli.AgentAction(kind="read_head", path="docs/a.txt", reason="inspect doc", role="document_analyst")],
             ),
             (
+                [],
+                [],
+            ),
+            (
+                [],
+                [],
+            ),
+            (
                 [cli.AgentHypothesis(label="credential handoff", rationale="follow credential clue", role="credential_hunter")],
                 [cli.AgentAction(kind="content_search", query="password", reason="follow credential clue", role="credential_hunter")],
             ),
@@ -1809,6 +1865,10 @@ class AgentModeTests(unittest.TestCase):
             (
                 [cli.AgentHypothesis(label="check vpn", rationale="possible token reuse", role="credential_hunter")],
                 [cli.AgentAction(kind="read_head", path="notes.txt", reason="inspect initial note", role="document_analyst")],
+            ),
+            (
+                [],
+                [],
             ),
             (
                 [],

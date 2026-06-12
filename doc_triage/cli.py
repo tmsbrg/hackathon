@@ -3719,6 +3719,53 @@ def plan_hypothesis_fanout_actions(
             additional_actions.append(action)
             if len(additional_actions) >= remaining_budget:
                 break
+        hypothesis_candidates = prioritize_inconclusive_hypotheses(role_hypotheses, observations)[:2]
+        for hypothesis_index, hypothesis in enumerate(hypothesis_candidates, start=1):
+            remaining_budget = max(0, args.agent_max_actions - len(seeded_actions) - len(additional_actions))
+            if remaining_budget <= 0:
+                break
+            try:
+                progress_log(
+                    args.verbose,
+                    "agent",
+                    f"Planning targeted hypothesis actions for subagent {role} ({hypothesis_index}/{len(hypothesis_candidates)}): {hypothesis.label}",
+                )
+                focused_hypotheses, focused_actions = request_agent_plan(
+                    args.ollama_url,
+                    args.model,
+                    build_hypothesis_focus_prompt(
+                        target,
+                        recon,
+                        findings[: args.max_llm_files],
+                        observations,
+                        hypothesis,
+                        seeded_actions + additional_actions,
+                        remaining_budget,
+                    ),
+                    model_retries=args.model_retries,
+                    timeout_seconds=args.ollama_timeout,
+                    verbose=args.debug,
+                    stage_label=f"agent-plan-hypothesis-fanout-{role}-{hypothesis_index}",
+                )
+            except Exception as exc:
+                warnings.append(f"agent hypothesis planning failed for {role}:{hypothesis.label}: {exc}")
+                continue
+            for focused_hypothesis in focused_hypotheses:
+                focused_hypothesis.role = focused_hypothesis.role or role
+                if all(
+                    existing.label != focused_hypothesis.label or existing.rationale != focused_hypothesis.rationale
+                    for existing in hypotheses + additional_hypotheses
+                ):
+                    additional_hypotheses.append(focused_hypothesis)
+            for action in deduplicate_agent_actions(focused_actions):
+                action.role = action.role or role
+                key = (action.kind, action.path, action.query, action.code)
+                if key in action_keys:
+                    continue
+                action_keys.add(key)
+                additional_actions.append(action)
+                if len(additional_actions) >= remaining_budget:
+                    break
     return additional_hypotheses, additional_actions, warnings
 
 
