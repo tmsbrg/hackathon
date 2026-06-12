@@ -134,6 +134,19 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertEqual(actions[0].kind, "email_parse")
 
+    def test_summarize_agent_plan_natural_language_describes_actions(self) -> None:
+        summary = cli.summarize_agent_plan_natural_language(
+            [cli.AgentHypothesis(label="review backups", rationale="credentials may be there")],
+            [
+                cli.AgentAction(kind="zip_list", path="IT/backups/nightly.zip", reason="inspect archive"),
+                cli.AgentAction(kind="content_search", query="password", reason="search secrets"),
+            ],
+        )
+
+        self.assertIn("investigate review backups", summary)
+        self.assertIn("inspect archive IT/backups/nightly.zip", summary)
+        self.assertIn("search for password", summary)
+
     def test_parse_agent_hypotheses_accepts_string_entries(self) -> None:
         hypotheses = cli.parse_agent_hypotheses(["look for hidden archives"])
 

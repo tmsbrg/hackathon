@@ -23,8 +23,7 @@ def verbose_log(enabled: bool, message: str) -> None:
 
 
 def progress_log(enabled: bool, stage: str, message: str) -> None:
-    if enabled:
-        print(f"[doc-triage] [{stage}] {message}")
+    print(f"[doc-triage] [{stage}] {message}")
 
 
 def summarize_agent_action(action: AgentAction) -> str:

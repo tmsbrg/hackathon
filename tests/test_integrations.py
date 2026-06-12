@@ -647,8 +647,31 @@ class IntegrationTests(unittest.TestCase):
         rendered = cli.render_terminal_report(report)
 
         self.assertIn("Sensitive Report", rendered)
-        self.assertIn("password=secret", rendered)
+        self.assertIn("password=", rendered)
         self.assertIn("\u001b[", rendered)
+        self.assertIn(f"password={cli.colorize('secret', 'critical')}", rendered)
+
+    def test_cli_standard_output_shows_progress_and_full_report(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "case"
+            root.mkdir()
+            (root / "secret.txt").write_text("password=secret\n", encoding="utf-8")
+            report = Path(td) / "report.md"
+            result = subprocess.run(
+                ["python3", "-m", "doc_triage.cli", "scan", str(root), "--output", str(report), "--no-llm"],
+                cwd="/home/seal/Documents/hackathon",
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[doc-triage] [scan] Starting scan", result.stdout)
+        self.assertIn("Sensitive Report", result.stdout)
+        self.assertIn("password=secret", result.stdout)
 
 
 if __name__ == "__main__":

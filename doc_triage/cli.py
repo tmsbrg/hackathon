@@ -112,6 +112,39 @@ def emit_verbose_llm_output(verbose: bool, stage: str, content: str, max_chars: 
     verbose_log(True, f"[{stage}] model output follows:\n{compact}")
 
 
+def summarize_agent_plan_natural_language(
+    hypotheses: Sequence["AgentHypothesis"],
+    actions: Sequence["AgentAction"],
+    limit: int = 4,
+) -> str:
+    parts: list[str] = []
+    active_hypotheses = [item.label.strip() for item in hypotheses if item.label.strip()]
+    if active_hypotheses:
+        parts.append("investigate " + "; ".join(active_hypotheses[:2]))
+    action_phrases: list[str] = []
+    for action in actions[:limit]:
+        target = (action.query or action.path).strip()
+        if action.kind == "content_search":
+            action_phrases.append(f"search for {target}")
+        elif action.kind == "dir_list":
+            action_phrases.append(f"list {target}")
+        elif action.kind == "zip_list":
+            action_phrases.append(f"inspect archive {target}")
+        elif action.kind == "pdf_text_head":
+            action_phrases.append(f"read PDF text from {target}")
+        elif action.kind == "email_parse":
+            action_phrases.append(f"parse email {target}")
+        elif action.kind == "image_ocr_light":
+            action_phrases.append(f"OCR image {target}")
+        elif action.kind == "file_info":
+            action_phrases.append(f"identify file type for {target}")
+        else:
+            action_phrases.append(f"inspect {target}")
+    if action_phrases:
+        parts.append(", then " + "; ".join(action_phrases))
+    return "".join(parts) if parts else "no concrete plan actions produced"
+
+
 def render_agent_plan_records(hypotheses: Sequence["AgentHypothesis"], actions: Sequence["AgentAction"]) -> str:
     records: list[str] = []
     for hypothesis in hypotheses:
@@ -419,6 +452,7 @@ def run_doctor() -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="doc-triage")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("doctor")
@@ -3198,7 +3232,7 @@ def plan_hypothesis_fanout_actions(
                 ),
                 model_retries=args.model_retries,
                 timeout_seconds=args.ollama_timeout,
-                verbose=args.verbose,
+                verbose=args.debug,
                 stage_label=f"agent-plan-hypothesis-{index}",
             )
         except Exception as exc:
@@ -3330,7 +3364,7 @@ def run_agent_mode(
             build_agent_plan_prompt(target, recon, findings[: args.max_llm_files], args.agent_max_actions),
             model_retries=args.model_retries,
             timeout_seconds=args.ollama_timeout,
-            verbose=args.verbose,
+            verbose=args.debug,
             stage_label="agent-plan-initial",
         )
     except Exception as exc:
@@ -3341,6 +3375,7 @@ def run_agent_mode(
     if not hypotheses:
         hypotheses = fallback_hypotheses
     planned_actions = deduplicate_agent_actions(planned_actions)
+    progress_log(args.verbose, "agent", "Plan summary: " + summarize_agent_plan_natural_language(hypotheses, planned_actions))
     fanout_hypotheses, fanout_actions, fanout_warnings = plan_hypothesis_fanout_actions(
         target,
         recon,
@@ -3353,6 +3388,8 @@ def run_agent_mode(
     warnings.extend(fanout_warnings)
     if fanout_hypotheses:
         hypotheses = [*hypotheses, *fanout_hypotheses]
+    if fanout_actions:
+        progress_log(args.verbose, "agent", "Focused plan summary: " + summarize_agent_plan_natural_language(fanout_hypotheses or hypotheses, fanout_actions))
     actions = merge_agent_actions([*planned_actions, *fanout_actions], fallback_actions, args.agent_max_actions)
     progress_log(
         args.verbose,
@@ -3389,7 +3426,7 @@ def run_agent_mode(
             ),
             model_retries=args.model_retries,
             timeout_seconds=args.ollama_timeout,
-            verbose=args.verbose,
+            verbose=args.debug,
             stage_label="agent-plan-refine",
         )
     except Exception as exc:
@@ -3398,6 +3435,8 @@ def run_agent_mode(
         progress_log(args.verbose, "agent", f"Refinement failed; continuing without follow-up plan ({exc})")
 
     all_hypotheses = hypotheses or refined_hypotheses or fallback_hypotheses
+    if refined_actions:
+        progress_log(args.verbose, "agent", "Refined plan summary: " + summarize_agent_plan_natural_language(refined_hypotheses or all_hypotheses, refined_actions))
     remaining_budget = max(0, args.agent_max_actions - len(actions))
     second_batch = []
     if remaining_budget > 0:
@@ -3480,7 +3519,7 @@ def run_agent_mode(
             llm_summary_prompt,
             model_retries=args.model_retries,
             timeout_seconds=args.ollama_timeout,
-            verbose=args.verbose,
+            verbose=args.debug,
         )
     except RuntimeError as exc:
         warnings.append(f"agent summary failed: {exc}")
@@ -3680,7 +3719,7 @@ def run_scan(args: argparse.Namespace) -> int:
             observations=[],
             model_retries=args.model_retries,
             timeout_seconds=args.ollama_timeout,
-            verbose=args.verbose,
+            verbose=args.debug,
             stage_label="llm-false-positive-review",
         )
         if removed_findings:
@@ -3693,7 +3732,7 @@ def run_scan(args: argparse.Namespace) -> int:
                 target,
                 findings,
                 args.max_llm_files,
-                verbose=args.verbose,
+                verbose=args.debug,
                 model_retries=args.model_retries,
                 timeout_seconds=args.ollama_timeout,
             )

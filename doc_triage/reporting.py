@@ -18,8 +18,60 @@ def summarize_evidence(text: str, limit: int = 120) -> str:
     return compact[: limit - 3] + "..."
 
 
+FULL_VALUE_HIGHLIGHT_PATTERNS = (
+    re.compile(r"\b(?:flag|bonus|idek|bi0sCTF|EQCTF|icc)\{[^}\s]{3,120}\}", re.IGNORECASE),
+    re.compile(r"\bghp_[A-Za-z0-9_]+\b"),
+    re.compile(r"\bAKIA[A-Z0-9]+\b"),
+    re.compile(r"\b(?:sk|pk)_live_[A-Za-z0-9]+\b"),
+    re.compile(r"\bwhsec_[A-Za-z0-9]+\b"),
+    re.compile(r"\bfin_api_[A-Za-z0-9_]+\b"),
+    re.compile(r"\b\d{9}\b"),
+)
+ASSIGNMENT_VALUE_PATTERNS = (
+    re.compile(
+        r"(?i)\b(?:password|passwd|pwd|wachtwoord|tijdelijk_wachtwoord|secret|client_secret|token|github_token|api_key(?:_value)?|access_key_id|secret_access_key|burgerservicenummer|bsn)\b[^:=\n]*[:=]\s*[\"']?([^\"'\s,`]+)"
+    ),
+)
+
+
+def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+            continue
+        merged.append((start, end))
+    return merged
+
+
+def highlight_sensitive_text(text: str) -> str:
+    spans: list[tuple[int, int]] = []
+    for pattern in FULL_VALUE_HIGHLIGHT_PATTERNS:
+        for match in pattern.finditer(text):
+            spans.append((match.start(), match.end()))
+    for pattern in ASSIGNMENT_VALUE_PATTERNS:
+        for match in pattern.finditer(text):
+            spans.append((match.start(1), match.end(1)))
+    if not spans:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merge_spans(spans):
+        if cursor < start:
+            pieces.append(text[cursor:start])
+        pieces.append(colorize(text[start:end], "critical"))
+        cursor = end
+    if cursor < len(text):
+        pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def highlight_inline_code(text: str) -> str:
-    return re.sub(r"`([^`]+)`", lambda match: colorize(match.group(1), "critical"), text)
+    return re.sub(r"`([^`]+)`", lambda match: highlight_sensitive_text(match.group(1)), text)
 
 
 def render_terminal_report(report: str) -> str:
