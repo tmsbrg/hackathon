@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import shutil
@@ -14,7 +15,6 @@ from pathlib import Path
 from typing import Sequence
 from urllib.error import URLError
 from urllib.request import Request, urlopen
-from urllib.parse import urlparse
 
 
 EXIT_OK = 0
@@ -103,6 +103,22 @@ def detect_tools() -> list[ToolStatus]:
     return statuses
 
 
+def ollama_health(ollama_url: str = "http://127.0.0.1:11434") -> tuple[bool, str]:
+    request = Request(f"{ollama_url.rstrip('/')}/api/tags", method="GET")
+    try:
+        with urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return False, f"unreachable ({exc})"
+    models = payload.get("models", [])
+    if not isinstance(models, list):
+        return False, "invalid response"
+    names = [item.get("name", "<unknown>") for item in models if isinstance(item, dict)]
+    if not names:
+        return True, "healthy (no local models)"
+    return True, f"healthy ({', '.join(names)})"
+
+
 def run_doctor() -> int:
     statuses = detect_tools()
     missing_required = [tool.name for tool in statuses if tool.required and not tool.path]
@@ -116,7 +132,11 @@ def run_doctor() -> int:
         print(f"- {tool.name}: {state}")
     print("LLM")
     ollama_status = next(item for item in statuses if item.name == "ollama")
-    print(f"- ollama: {ollama_status.path or 'missing'}")
+    if ollama_status.path:
+        healthy, detail = ollama_health()
+        print(f"- ollama: {ollama_status.path} [{detail}]")
+    else:
+        print("- ollama: missing")
     return EXIT_ERROR if missing_required else EXIT_OK
 
 
@@ -290,17 +310,32 @@ def extract_digit_runs(text: str) -> list[str]:
     return values
 
 
-def scan_target(target: Path, max_files: int | None, ocr: bool = False) -> tuple[list[Finding], list[str]]:
+def should_exclude(target: Path, file_path: Path, exclude_globs: Sequence[str]) -> bool:
+    relative = relative_source(target, file_path)
+    return any(fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(file_path.name, pattern) for pattern in exclude_globs)
+
+
+def scan_target(
+    target: Path,
+    max_files: int | None,
+    ocr: bool = False,
+    exclude_globs: Sequence[str] | None = None,
+) -> tuple[list[Finding], list[str]]:
     warnings: list[str] = []
     findings: list[Finding] = []
     file_count = 0
-    files = [file_path for file_path in sorted(target.rglob("*")) if file_path.is_file()]
+    exclude_globs = list(exclude_globs or [])
+    files = [
+        file_path
+        for file_path in sorted(target.rglob("*"))
+        if file_path.is_file() and not should_exclude(target, file_path, exclude_globs)
+    ]
 
     if max_files is not None and len(files) > max_files:
         warnings.append(f"File limit reached at {max_files} files.")
         files = files[:max_files]
 
-    external_findings, external_warnings = run_external_scanners(target)
+    external_findings, external_warnings = run_external_scanners(target, exclude_globs=exclude_globs)
     findings.extend(external_findings)
     warnings.extend(external_warnings)
 
@@ -329,9 +364,10 @@ def scan_target(target: Path, max_files: int | None, ocr: bool = False) -> tuple
     return deduplicate_findings(findings), warnings
 
 
-def run_external_scanners(target: Path) -> tuple[list[Finding], list[str]]:
+def run_external_scanners(target: Path, exclude_globs: Sequence[str] | None = None) -> tuple[list[Finding], list[str]]:
     warnings: list[str] = []
     findings: list[Finding] = []
+    exclude_globs = list(exclude_globs or [])
 
     rg_result = run_command(["rg", "--files", str(target)])
     if rg_result.timed_out:
@@ -339,7 +375,11 @@ def run_external_scanners(target: Path) -> tuple[list[Finding], list[str]]:
     elif rg_result.exit_code not in (0, 1):
         warnings.append("rg --files failed.")
 
-    rga_result = run_command(["rga", "--json", ".", str(target)])
+    rga_command = ["rga", "--json"]
+    for pattern in exclude_globs:
+        rga_command.extend(["-g", f"!{pattern}"])
+    rga_command.extend([".", str(target)])
+    rga_result = run_command(rga_command)
     if rga_result.timed_out:
         warnings.append("rga timed out.")
     elif rga_result.exit_code in (0, 1):
@@ -349,7 +389,10 @@ def run_external_scanners(target: Path) -> tuple[list[Finding], list[str]]:
     else:
         warnings.append("rga failed.")
 
-    trufflehog_result = run_command(["trufflehog", "filesystem", "--json", "--no-update", str(target)])
+    trufflehog_command = ["trufflehog", "filesystem", "--json", "--no-update", str(target)]
+    for pattern in exclude_globs:
+        trufflehog_command.extend(["--exclude-paths", pattern])
+    trufflehog_result = run_command(trufflehog_command)
     if trufflehog_result.timed_out:
         warnings.append("trufflehog timed out.")
     elif trufflehog_result.exit_code in (0, 183):
@@ -400,6 +443,19 @@ def collect_ocr_findings(target: Path, files: list[Path], work_dir: Path) -> tup
                 finding.metadata["ocr_source"] = file_path.name
             findings.extend(pdf_findings)
     return findings, warnings
+
+
+def request_ollama_json(ollama_url: str, body: dict[str, object]) -> dict[str, object]:
+    request = Request(
+        f"{ollama_url.rstrip('/')}/api/generate",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    response_text = payload.get("response", "{}")
+    return json.loads(response_text)
 
 
 def parse_rga_output(payload: str, target: Path) -> tuple[list[Finding], list[str]]:
@@ -471,7 +527,7 @@ def parse_trufflehog_output(payload: str, target: Path) -> tuple[list[Finding], 
 
 
 def generate_llm_summary(ollama_url: str, model: str, findings: list[Finding], max_files: int) -> dict[str, object]:
-    selected_findings = findings[:max_files]
+    selected_findings = select_llm_findings(findings, max_files)
     evidence_lines = [
         {
             "source": finding.source,
@@ -491,30 +547,58 @@ def generate_llm_summary(ollama_url: str, model: str, findings: list[Finding], m
         ],
         "findings": evidence_lines,
     }
-    request = Request(
-        f"{ollama_url.rstrip('/')}/api/generate",
-        data=json.dumps(
+    required_keys = {"executive_summary", "priority_findings", "relationships", "review_order"}
+    parsed: dict[str, object] | None = None
+    first_error: Exception | None = None
+    try:
+        parsed = request_ollama_json(
+            ollama_url,
             {
                 "model": model,
                 "stream": False,
                 "format": "json",
                 "prompt": json.dumps(prompt),
-            }
-        ).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            },
+        )
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Ollama request failed: {exc}") from exc
-    content = payload.get("response", "{}")
-    parsed = json.loads(content)
-    required_keys = {"executive_summary", "priority_findings", "relationships", "review_order"}
+        first_error = exc
+    except Exception as exc:
+        first_error = exc
+
+    if parsed is None or not required_keys.issubset(parsed):
+        try:
+            parsed = request_ollama_json(
+                ollama_url,
+                {
+                    "model": model,
+                    "stream": False,
+                    "format": "json",
+                    "prompt": (
+                        "Repair the previous answer into strict JSON with keys "
+                        "executive_summary, priority_findings, relationships, review_order.\n"
+                        + json.dumps({"previous_response": parsed, "original_prompt": prompt, "error": str(first_error)})
+                    ),
+                },
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Ollama response repair failed: {exc}") from exc
     if not required_keys.issubset(parsed):
         raise RuntimeError("Ollama response did not include the required JSON keys.")
     return parsed
+
+
+def select_llm_findings(findings: list[Finding], max_files: int) -> list[Finding]:
+    selected: list[Finding] = []
+    seen_sources: set[str] = set()
+    for finding in findings:
+        if finding.source in seen_sources:
+            selected.append(finding)
+            continue
+        if len(seen_sources) >= max_files:
+            continue
+        seen_sources.add(finding.source)
+        selected.append(finding)
+    return selected
 
 
 def render_report(
@@ -611,7 +695,12 @@ def run_scan(args: argparse.Namespace) -> int:
     if not target.exists() or not target.is_dir():
         return EXIT_ERROR
 
-    findings, warnings = scan_target(target, args.max_files, ocr=args.ocr)
+    exclude_globs = list(args.exclude)
+    output_path = Path(args.output).expanduser().resolve()
+    if output_path.is_relative_to(target):
+        exclude_globs.append(relative_source(target, output_path))
+
+    findings, warnings = scan_target(target, args.max_files, ocr=args.ocr, exclude_globs=exclude_globs)
     llm_summary: dict[str, object] | None = None
     if not args.no_llm and findings:
         try:
@@ -620,7 +709,7 @@ def run_scan(args: argparse.Namespace) -> int:
             warnings.append(str(exc))
 
     report = render_report(args, target, findings, warnings, llm_summary=llm_summary)
-    write_report(Path(args.output).expanduser(), report)
+    write_report(output_path, report)
 
     statuses = detect_tools()
     missing_required = [tool.name for tool in statuses if tool.required and not tool.path]
