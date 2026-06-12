@@ -337,6 +337,43 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(any(action.kind == "content_search" for action in actions))
         self.assertTrue(any("document_analyst -> credential_hunter" in note for note in notes))
 
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    def test_plan_cross_role_replans_requests_role_specific_replan(self, request_agent_plan: mock.Mock) -> None:
+        request_agent_plan.return_value = (
+            [cli.AgentHypothesis(label="credential follow-up", rationale="handoff", role="credential_hunter")],
+            [cli.AgentAction(kind="content_search", query="password", reason="replanned credential search", role="credential_hunter")],
+        )
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / "docs").mkdir()
+            (target / "docs" / "notes.txt").write_text("temporary password: Welkom123\n", encoding="utf-8")
+            observations = [
+                cli.AgentObservation(
+                    path="docs/notes.txt",
+                    evidence="temporary password: Welkom123",
+                    source_mechanism="read_head",
+                    confidence=0.9,
+                    role="document_analyst",
+                    derived_claim="Found likely login material",
+                )
+            ]
+
+            hypotheses, actions, warnings, notes = cli.plan_cross_role_replans(
+                target,
+                {"representative_heads": []},
+                [],
+                observations,
+                [],
+                args,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(request_agent_plan.call_count, 1)
+        self.assertTrue(any(h.role == "credential_hunter" for h in hypotheses))
+        self.assertTrue(any(a.role == "credential_hunter" for a in actions))
+        self.assertTrue(any("document_analyst -> credential_hunter" in note for note in notes))
+
     def test_parse_agent_actions_normalizes_zip_list_directory_target(self) -> None:
         actions = cli.parse_agent_actions(
             [{"kind": "zip_list", "path": "ctf_cases/bad_blockchain", "reason": "inspect archive-like target"}]
@@ -1502,6 +1539,10 @@ class AgentModeTests(unittest.TestCase):
                 [cli.AgentAction(kind="read_head", path="docs/a.txt", reason="inspect document", role="document_analyst")],
             ),
             (
+                [cli.AgentHypothesis(label="credential handoff", rationale="follow handoff", role="credential_hunter")],
+                [cli.AgentAction(kind="content_search", query="password", reason="Handoff from document_analyst via model plan", role="credential_hunter")],
+            ),
+            (
                 [cli.AgentHypothesis(label="review docs", rationale="start with document", status="confirmed", role="document_analyst")],
                 [],
             ),
@@ -1545,7 +1586,8 @@ class AgentModeTests(unittest.TestCase):
         self.assertGreaterEqual(execute_agent_actions.call_count, 2)
         followup_actions = execute_agent_actions.call_args_list[1].args[1]
         self.assertTrue(any(action.role == "credential_hunter" for action in followup_actions))
-        self.assertTrue(any("Handoff from document_analyst" in (action.reason or "") for action in followup_actions))
+        self.assertTrue(any("document_analyst" in (action.reason or "") for action in followup_actions))
+        self.assertGreaterEqual(request_agent_plan.call_count, 3)
         self.assertTrue(any(observation.role == "credential_hunter" for observation in run.observations))
 
 

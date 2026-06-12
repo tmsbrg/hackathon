@@ -365,6 +365,101 @@ def build_cross_role_handoff_plan(
     return hypotheses, deduplicate_agent_actions(actions)[:action_budget], notes[:action_budget]
 
 
+def plan_cross_role_replans(
+    target: Path,
+    recon: dict[str, object],
+    findings: list[Finding],
+    observations: list[AgentObservation],
+    existing_actions: list[AgentAction],
+    args: argparse.Namespace,
+) -> tuple[list[AgentHypothesis], list[AgentAction], list[str], list[str]]:
+    fallback_hypotheses, fallback_actions, notes = build_cross_role_handoff_plan(
+        target,
+        observations,
+        existing_actions,
+        max(0, args.agent_max_actions - len(existing_actions)),
+    )
+    if not fallback_actions:
+        return [], [], [], []
+
+    warnings: list[str] = []
+    planned_hypotheses: list[AgentHypothesis] = []
+    planned_actions: list[AgentAction] = []
+    action_keys = {
+        (action.kind, action.path, action.query, hashlib.sha256(action.code.encode("utf-8")).hexdigest())
+        for action in existing_actions
+    }
+    grouped_hypotheses = group_hypotheses_by_role(fallback_hypotheses)
+    for role, role_hypotheses in grouped_hypotheses.items():
+        remaining_budget = max(
+            0,
+            args.agent_max_actions - len(existing_actions) - len(planned_actions),
+        )
+        if remaining_budget <= 0:
+            break
+        role_observations = [
+            observation
+            for observation in observations
+            if any(target_role == role for target_role, _ in infer_observation_handoff_targets(observation))
+        ]
+        try:
+            progress_log(
+                args.verbose,
+                "agent",
+                f"Requesting handoff replanning for subagent {role} from {len(role_observations)} observations",
+            )
+            focused_hypotheses, focused_actions = request_agent_plan(
+                args.ollama_url,
+                args.model,
+                build_role_focus_prompt(
+                    target,
+                    recon,
+                    findings[: args.max_llm_files],
+                    role_observations,
+                    role,
+                    role_hypotheses,
+                    [*existing_actions, *planned_actions],
+                    remaining_budget,
+                ),
+                model_retries=args.model_retries,
+                timeout_seconds=args.ollama_timeout,
+                verbose=args.debug,
+                stage_label=f"agent-plan-handoff-{role}",
+            )
+        except Exception as exc:
+            warnings.append(f"agent handoff replanning failed for {role}: {exc}")
+            focused_hypotheses = []
+            focused_actions = []
+        if not focused_actions:
+            focused_hypotheses = role_hypotheses
+            focused_actions = [action for action in fallback_actions if action.role == role]
+        for hypothesis in focused_hypotheses:
+            hypothesis.role = hypothesis.role or role
+            if all(
+                existing.role != hypothesis.role
+                or existing.label != hypothesis.label
+                or existing.rationale != hypothesis.rationale
+                for existing in planned_hypotheses
+            ):
+                planned_hypotheses.append(hypothesis)
+        fallback_for_role = [action for action in fallback_actions if action.role == role]
+        merged_role_actions = merge_agent_actions(
+            [action for action in deduplicate_agent_actions(focused_actions) if (action.role or role) == role],
+            fallback_for_role,
+            remaining_budget,
+        )
+        for action in merged_role_actions:
+            action.role = action.role or role
+            key = (action.kind, action.path, action.query, hashlib.sha256(action.code.encode("utf-8")).hexdigest())
+            if key in action_keys:
+                continue
+            action_keys.add(key)
+            planned_actions.append(action)
+            if len(planned_actions) >= remaining_budget:
+                break
+    return planned_hypotheses, deduplicate_agent_actions(planned_actions), warnings, notes
+
+
 def render_agent_plan_records(hypotheses: Sequence["AgentHypothesis"], actions: Sequence["AgentAction"]) -> str:
     records: list[str] = []
     for hypothesis in hypotheses:
@@ -3777,12 +3872,15 @@ def run_agent_mode(
     handoff_actions: list[AgentAction] = []
     handoff_notes: list[str] = []
     if handoff_budget > 0 and observations:
-        handoff_hypotheses, handoff_actions, handoff_notes = build_cross_role_handoff_plan(
+        handoff_hypotheses, handoff_actions, handoff_warnings, handoff_notes = plan_cross_role_replans(
             target,
+            recon,
+            findings,
             observations,
             actions,
-            handoff_budget,
+            args,
         )
+        warnings.extend(handoff_warnings)
         if handoff_actions:
             hypotheses = [*hypotheses, *handoff_hypotheses]
             progress_log(
