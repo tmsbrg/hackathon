@@ -9,6 +9,13 @@ from doc_triage import cli
 
 
 class ContractEdgeTests(unittest.TestCase):
+    def test_run_command_caps_stdout_and_marks_truncation(self) -> None:
+        result = cli.run_command(["python3", "-c", "print('x' * 5000)"], max_output_chars=100)
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.metadata["stdout_truncated"])
+        self.assertLessEqual(len(result.stdout), 100)
+
     @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
     def test_scan_target_respects_exclude_globs(self, _: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -104,7 +111,7 @@ class ContractEdgeTests(unittest.TestCase):
         response.read.return_value = json.dumps({"models": [{"name": "qwen3:8b"}]}).encode("utf-8")
         urlopen.return_value = response
 
-        with mock.patch(
+        with mock.patch("doc_triage.cli.tool_version", side_effect=lambda name: f"{name}-1.0"), mock.patch(
             "doc_triage.cli.detect_tools",
             return_value=[
                 cli.ToolStatus("rg", "/usr/bin/rg", True),
@@ -122,6 +129,18 @@ class ContractEdgeTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("healthy", stdout.getvalue())
+        self.assertIn("rg-1.0", stdout.getvalue())
+
+    def test_cleanup_tempdirs_removes_registered_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_path = Path(tmpdir, "ocr-work")
+            temp_path.mkdir()
+            cli.register_tempdir(temp_path)
+            self.assertTrue(temp_path.exists())
+
+            cli.cleanup_tempdirs()
+
+            self.assertFalse(temp_path.exists())
 
 
 if __name__ == "__main__":

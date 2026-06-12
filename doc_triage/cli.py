@@ -5,6 +5,7 @@ import fnmatch
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -45,6 +46,7 @@ KEYWORD_RULES = {
     "bsn": ("personal-data", "medium", 0.7),
 }
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+REGISTERED_TEMPDIRS: set[Path] = set()
 
 
 @dataclass(slots=True)
@@ -60,6 +62,7 @@ class CommandResult:
     stdout: str
     stderr: str
     timed_out: bool
+    metadata: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -125,11 +128,13 @@ def run_doctor() -> int:
     print("Required")
     for tool in [item for item in statuses if item.required]:
         state = tool.path or "missing"
-        print(f"- {tool.name}: {state}")
+        version = tool_version(tool.name) if tool.path else "n/a"
+        print(f"- {tool.name}: {state} [{version}]")
     print("Optional OCR")
     for tool in [item for item in statuses if not item.required and item.name != "ollama"]:
         state = tool.path or "missing"
-        print(f"- {tool.name}: {state}")
+        version = tool_version(tool.name) if tool.path else "n/a"
+        print(f"- {tool.name}: {state} [{version}]")
     print("LLM")
     ollama_status = next(item for item in statuses if item.name == "ollama")
     if ollama_status.path:
@@ -140,7 +145,18 @@ def run_doctor() -> int:
     return EXIT_ERROR if missing_required else EXIT_OK
 
 
-def run_command(command: list[str], timeout: int = 30, cwd: Path | None = None) -> CommandResult:
+def truncate_output(value: str, max_output_chars: int) -> tuple[str, bool]:
+    if len(value) <= max_output_chars:
+        return value, False
+    return value[:max_output_chars], True
+
+
+def run_command(
+    command: list[str],
+    timeout: int = 30,
+    cwd: Path | None = None,
+    max_output_chars: int = 20000,
+) -> CommandResult:
     try:
         completed = subprocess.run(
             command,
@@ -152,18 +168,24 @@ def run_command(command: list[str], timeout: int = 30, cwd: Path | None = None) 
             cwd=str(cwd) if cwd is not None else None,
             check=False,
         )
+        stdout, stdout_truncated = truncate_output(completed.stdout, max_output_chars)
+        stderr, stderr_truncated = truncate_output(completed.stderr, max_output_chars)
         return CommandResult(
             exit_code=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            stdout=stdout,
+            stderr=stderr,
             timed_out=False,
+            metadata={"stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated},
         )
     except subprocess.TimeoutExpired as exc:
+        stdout, stdout_truncated = truncate_output(exc.stdout or "", max_output_chars)
+        stderr, stderr_truncated = truncate_output(exc.stderr or "", max_output_chars)
         return CommandResult(
             exit_code=1,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or "",
+            stdout=stdout,
+            stderr=stderr,
             timed_out=True,
+            metadata={"stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated},
         )
     except FileNotFoundError as exc:
         return CommandResult(
@@ -171,7 +193,51 @@ def run_command(command: list[str], timeout: int = 30, cwd: Path | None = None) 
             stdout="",
             stderr=str(exc),
             timed_out=False,
+            metadata={"stdout_truncated": False, "stderr_truncated": False},
         )
+
+
+def tool_version(name: str) -> str:
+    commands = {
+        "rg": [name, "--version"],
+        "rga": [name, "--version"],
+        "trufflehog": [name, "--version"],
+        "tesseract": [name, "--version"],
+        "ocrmypdf": [name, "--version"],
+        "pdftotext": [name, "-v"],
+        "ollama": [name, "--version"],
+    }
+    command = commands.get(name)
+    if command is None:
+        return "unknown"
+    result = run_command(command, timeout=5, max_output_chars=200)
+    if result.exit_code != 0:
+        return "unavailable"
+    first_line = (result.stdout or result.stderr).splitlines()
+    return first_line[0].strip() if first_line else "unknown"
+
+
+def register_tempdir(path: Path) -> None:
+    REGISTERED_TEMPDIRS.add(path)
+
+
+def unregister_tempdir(path: Path) -> None:
+    REGISTERED_TEMPDIRS.discard(path)
+
+
+def cleanup_tempdirs() -> None:
+    for path in list(REGISTERED_TEMPDIRS):
+        shutil.rmtree(path, ignore_errors=True)
+        unregister_tempdir(path)
+
+
+def install_signal_handlers() -> None:
+    def _handle_signal(signum: int, _frame: object) -> None:
+        cleanup_tempdirs()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
 
 
 def is_valid_bsn(value: str) -> bool:
@@ -357,7 +423,10 @@ def scan_target(
 
     if ocr:
         with tempfile.TemporaryDirectory(prefix="doc-triage-ocr-") as temp_dir:
-            ocr_findings, ocr_warnings = collect_ocr_findings(target, files, Path(temp_dir))
+            temp_path = Path(temp_dir)
+            register_tempdir(temp_path)
+            ocr_findings, ocr_warnings = collect_ocr_findings(target, files, temp_path)
+            unregister_tempdir(temp_path)
         findings.extend(ocr_findings)
         warnings.extend(ocr_warnings)
 
@@ -717,6 +786,7 @@ def run_scan(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    install_signal_handlers()
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.command is None:
