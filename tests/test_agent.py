@@ -189,6 +189,34 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].metadata["timeout_seconds"], "7")
 
+    def test_salvage_agent_plan_matches_basename_stem_and_keyword(self) -> None:
+        hypotheses, actions = cli.salvage_agent_plan_from_text(
+            "The sequence case looks important. Focus on cookie artifacts first.",
+            {
+                "target": "/tmp/case",
+                "recon": {"sample_files": ["ctf_cases/sequence/ctf/sequence.txt"]},
+            },
+        )
+
+        self.assertTrue(hypotheses)
+        self.assertTrue(any(action.path == "ctf_cases/sequence/ctf/sequence.txt" for action in actions))
+        self.assertTrue(any(action.kind == "content_search" and action.query == "cookie" for action in actions))
+
+    def test_salvage_agent_plan_falls_back_to_known_paths_when_no_match(self) -> None:
+        _, actions = cli.salvage_agent_plan_from_text(
+            "Investigate the most relevant artifacts in this dataset.",
+            {
+                "target": "/tmp/case",
+                "recon": {"sample_files": ["docs/a.txt", "mail/inbox.eml"]},
+            },
+        )
+
+        self.assertTrue(actions)
+        self.assertEqual(actions[0].path, "docs/a.txt")
+
+    def test_salvage_summary_from_text_rejects_trivial_content(self) -> None:
+        self.assertIsNone(cli.salvage_summary_from_text("{", {"recon": {"sample_files": ["a.txt"]}}))
+
     def test_parse_agent_plan_lines_accepts_glm_key_value_format(self) -> None:
         payload = (
             "hypothesis|label=Investigate CTF files|rationale=The target contains multiple cases.|status=proposed\n"
@@ -598,7 +626,41 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(hypotheses, [])
         self.assertEqual(len(actions), 1)
         self.assertIn("[agent-plan-test attempt 1] model output follows:", stdout.getvalue())
-        self.assertIn("action|kind=dir_list", stdout.getvalue())
+        self.assertIn("action|dir_list|docs|Inspect docs.|5|5", stdout.getvalue())
+
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_plan_verbose_suppresses_prose_output(self, urlopen: mock.Mock) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        response.read.return_value = json.dumps(
+            {
+                "response": (
+                    'The most significant finding is in sequence.txt. '
+                    'Extract the cookie value from "sequence.txt" and inspect it.'
+                )
+            }
+        ).encode("utf-8")
+        urlopen.return_value = response
+
+        stdout = StringIO()
+        with contextlib.redirect_stdout(stdout):
+            hypotheses, actions = cli.request_agent_plan(
+                "http://127.0.0.1:11434",
+                "qwen3:8b",
+                {
+                    "target": "/tmp/case",
+                    "recon": {"sample_files": ["sequence.txt"]},
+                    "instructions": ["Return hypotheses and actions"],
+                },
+                verbose=True,
+                stage_label="agent-plan-test",
+            )
+
+        self.assertTrue(hypotheses)
+        self.assertTrue(actions)
+        self.assertIn("[agent-plan-test salvaged attempt 1] model output follows:", stdout.getvalue())
+        self.assertNotIn("The most significant finding is in sequence.txt", stdout.getvalue())
 
     @mock.patch("doc_triage.cli.urlopen")
     def test_request_agent_plan_accepts_loose_schema_without_repair(self, urlopen: mock.Mock) -> None:

@@ -15,7 +15,7 @@ from dataclasses import asdict
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -105,6 +105,35 @@ def emit_verbose_llm_output(verbose: bool, stage: str, content: str, max_chars: 
     verbose_log(True, f"[{stage}] model output follows:\n{compact}")
 
 
+def render_agent_plan_records(hypotheses: Sequence["AgentHypothesis"], actions: Sequence["AgentAction"]) -> str:
+    records: list[str] = []
+    for hypothesis in hypotheses:
+        records.append(
+            "|".join(
+                (
+                    "hypothesis",
+                    hypothesis.label,
+                    hypothesis.rationale,
+                    hypothesis.status,
+                )
+            )
+        )
+    for action in actions:
+        records.append(
+            "|".join(
+                (
+                    "action",
+                    action.kind,
+                    action.query or action.path,
+                    action.reason,
+                    str(action.limit),
+                    action.metadata.get("timeout_seconds", "") or "0",
+                )
+            )
+        )
+    return "\n".join(records)
+
+
 def ollama_health(ollama_url: str = "http://127.0.0.1:11434") -> tuple[bool, str]:
     request = Request(f"{ollama_url.rstrip('/')}/api/tags", method="GET")
     try:
@@ -170,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--output", default="./report.md")
     scan.add_argument("--model", default="huihui_ai/qwen3.5-abliterated:9b")
     scan.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    scan.add_argument("--ollama-timeout", type=int, default=180)
     scan.add_argument("--ocr", action="store_true")
     scan.add_argument("--max-files", type=int)
     scan.add_argument("--max-llm-files", type=int, default=30)
@@ -343,14 +373,14 @@ def collect_ocr_findings(target: Path, files: list[Path], work_dir: Path) -> tup
     return findings, warnings
 
 
-def request_ollama_text(ollama_url: str, body: dict[str, object]) -> str:
+def request_ollama_text(ollama_url: str, body: dict[str, object], timeout_seconds: int = 180) -> str:
     request = Request(
         f"{ollama_url.rstrip('/')}/api/generate",
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    response = urlopen(request, timeout=30)
+    response = urlopen(request, timeout=timeout_seconds)
     register_closeable(response)
     try:
         payload = json.loads(response.read().decode("utf-8"))
@@ -360,8 +390,12 @@ def request_ollama_text(ollama_url: str, body: dict[str, object]) -> str:
     return str(payload.get("response") or payload.get("thinking") or "{}")
 
 
-def request_ollama_json(ollama_url: str, body: dict[str, object]) -> dict[str, object] | list[object]:
-    return parse_llm_json_text(request_ollama_text(ollama_url, body))
+def request_ollama_json(
+    ollama_url: str,
+    body: dict[str, object],
+    timeout_seconds: int = 180,
+) -> dict[str, object] | list[object]:
+    return parse_llm_json_text(request_ollama_text(ollama_url, body, timeout_seconds=timeout_seconds))
 
 
 def extract_json_candidate(value: str) -> str:
@@ -411,10 +445,15 @@ def request_structured_json(
     required_keys: set[str],
     repair_instruction: str,
     max_retries: int,
+    timeout_seconds: int = 180,
+    salvage_response: Callable[[str, dict[str, object]], dict[str, object] | None] | None = None,
+    verbose: bool = False,
+    stage_label: str = "structured-json",
 ) -> dict[str, object]:
     parsed: dict[str, object] | None = None
     last_error: Exception | None = None
     prior_response: dict[str, object] | None = None
+    last_response_text = ""
 
     for attempt in range(max_retries + 1):
         if attempt == 0:
@@ -447,9 +486,11 @@ def request_structured_json(
                 ),
             }
         try:
-            response = request_ollama_json(ollama_url, request_body)
+            last_response_text = request_ollama_text(ollama_url, request_body, timeout_seconds=timeout_seconds)
+            response = parse_llm_json_text(last_response_text)
             prior_response = response if isinstance(response, dict) else {"value": response}
             if isinstance(response, dict) and required_keys.issubset(response):
+                emit_verbose_llm_output(verbose, f"{stage_label} attempt {attempt + 1}", json.dumps(response, ensure_ascii=False))
                 return response
             parsed = response if isinstance(response, dict) else None
             last_error = RuntimeError("Ollama response did not include the required JSON keys.")
@@ -460,6 +501,11 @@ def request_structured_json(
 
     if isinstance(parsed, dict) and required_keys.issubset(parsed):
         return parsed
+    if salvage_response is not None and last_response_text.strip():
+        salvaged = salvage_response(last_response_text, prompt)
+        if isinstance(salvaged, dict) and required_keys.issubset(salvaged):
+            emit_verbose_llm_output(verbose, f"{stage_label} salvaged", json.dumps(salvaged, ensure_ascii=False))
+            return salvaged
     if last_error is not None and is_ollama_transport_error(last_error):
         raise RuntimeError(f"Ollama unavailable: {describe_ollama_transport_error(last_error)}") from last_error
     if attempt > 0 and last_error is not None:
@@ -716,6 +762,164 @@ def normalize_agent_plan_payload(payload: dict[str, object]) -> dict[str, object
     if "actions" not in normalized and isinstance(normalized.get("steps"), list):
         normalized["actions"] = normalized["steps"]
     return normalized
+
+
+def collect_prompt_paths(prompt: dict[str, object]) -> list[str]:
+    paths: list[str] = []
+
+    def _append(value: object) -> None:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped not in paths:
+                paths.append(stripped)
+
+    recon = prompt.get("recon")
+    if isinstance(recon, dict):
+        for key in ("sample_files", "flagged_sources"):
+            value = recon.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    _append(item)
+        for key in ("representative_heads", "mime_samples", "top_directories"):
+            value = recon.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        _append(item.get("path"))
+
+    for key in ("findings", "existing_actions", "observations"):
+        value = prompt.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    _append(item.get("source"))
+                    _append(item.get("source_path"))
+                    _append(item.get("path"))
+    return paths
+
+
+def salvage_agent_plan_from_text(response_text: str, prompt: dict[str, object]) -> tuple[list[AgentHypothesis], list[AgentAction]]:
+    target = Path(str(prompt.get("target") or "."))
+    known_paths = collect_prompt_paths(prompt)
+    matched_paths: list[str] = []
+    lowered_response = response_text.lower()
+    for candidate in known_paths:
+        candidate_path = Path(candidate)
+        basename = candidate_path.name.lower()
+        stem = candidate_path.stem.lower()
+        if candidate in response_text or (basename and basename in lowered_response) or (stem and stem in lowered_response):
+            if candidate not in matched_paths:
+                matched_paths.append(candidate)
+
+    quoted_terms = [
+        match.strip()
+        for match in re.findall(r'"([^"\n]{2,80})"', response_text)
+        if any(char.isalpha() for char in match)
+    ]
+    query_terms = [
+        term
+        for term in quoted_terms
+        if any(marker in term.lower() for marker in ("cookie", "set-cookie", "flag", "ip", "password", "token"))
+    ]
+    for marker in ("cookie", "set-cookie", "flag", "password", "token", "archive", "zip", "email", "pdf"):
+        if marker in lowered_response and marker not in {term.lower() for term in query_terms}:
+            query_terms.append(marker)
+
+    actions: list[AgentAction] = []
+    hypotheses: list[AgentHypothesis] = []
+    if response_text.strip():
+        summary = " ".join(response_text.split())
+        hypotheses.append(
+            AgentHypothesis(
+                label="Narrative plan salvage",
+                rationale=summary[:400],
+                status="inconclusive",
+            )
+        )
+
+    for path in matched_paths[:6]:
+        candidate = resolve_agent_action_path(target, path) or safe_relative_path(target, path)
+        if candidate is None:
+            actions.append(
+                AgentAction(
+                    kind="read_head",
+                    path=path,
+                    reason="Salvaged from narrative planner output.",
+                    limit=20,
+                )
+            )
+            continue
+        target_type = classify_agent_target(candidate) if candidate.exists() else "text"
+        kind = "read_head"
+        if target_type == "archive":
+            kind = "zip_list"
+        elif target_type == "email":
+            kind = "email_parse"
+        elif target_type == "image":
+            kind = "image_ocr_light"
+        elif target_type == "pdf":
+            kind = "pdf_text_head"
+        elif candidate.is_dir():
+            kind = "dir_list"
+        elif target_type == "binary":
+            kind = "file_info"
+        actions.append(
+            AgentAction(
+                kind=kind,
+                path=relative_source(target, candidate) if candidate.exists() else path,
+                reason="Salvaged from narrative planner output.",
+                limit=20,
+            )
+        )
+
+    for term in query_terms[:3]:
+        actions.append(
+            AgentAction(
+                kind="content_search",
+                query=term,
+                reason=f'Salvaged narrative query for "{term}".',
+                limit=20,
+            )
+        )
+
+    if not actions and known_paths:
+        for path in known_paths[:3]:
+            candidate = resolve_agent_action_path(target, path) or safe_relative_path(target, path)
+            if candidate is not None and candidate.exists() and candidate.is_dir():
+                kind = "dir_list"
+            else:
+                kind = "read_head"
+            actions.append(
+                AgentAction(
+                    kind=kind,
+                    path=path,
+                    reason="Fallback salvage from narrative planner output.",
+                    limit=20,
+                )
+            )
+
+    return hypotheses[:4], deduplicate_agent_actions(actions)[:8]
+
+
+def salvage_summary_from_text(response_text: str, prompt: dict[str, object]) -> dict[str, object] | None:
+    summary = " ".join(response_text.split())
+    if len(summary) < 20 or not re.search(r"[A-Za-z]{4,}", summary):
+        return None
+    known_paths = collect_prompt_paths(prompt)
+    mentioned_paths: list[str] = []
+    lowered_response = response_text.lower()
+    for candidate in known_paths:
+        basename = Path(candidate).name.lower()
+        if candidate in response_text or (basename and basename in lowered_response):
+            if candidate not in mentioned_paths:
+                mentioned_paths.append(candidate)
+    priority_findings = [{"source_path": path, "description": "Referenced in narrative summary output."} for path in mentioned_paths[:5]]
+    return {
+        "executive_summary": summary[:1200],
+        "priority_findings": priority_findings,
+        "relationships": [],
+        "review_order": mentioned_paths[:10],
+    }
 
 
 def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[AgentAction]]:
@@ -1998,6 +2202,7 @@ def request_agent_plan(
     model: str,
     prompt: dict[str, object],
     model_retries: int = 1,
+    timeout_seconds: int = 180,
     verbose: bool = False,
     stage_label: str = "agent-plan",
 ) -> tuple[list[AgentHypothesis], list[AgentAction]]:
@@ -2028,19 +2233,50 @@ def request_agent_plan(
                     "options": {"temperature": 0},
                     "prompt": json.dumps(request_prompt),
                 },
+                timeout_seconds=timeout_seconds,
             )
             previous_response = response_text
-            emit_verbose_llm_output(verbose, f"{stage_label} attempt {attempt + 1}", response_text)
             hypotheses, actions = parse_agent_plan_lines(response_text)
             if actions:
+                emit_verbose_llm_output(
+                    verbose,
+                    f"{stage_label} attempt {attempt + 1}",
+                    render_agent_plan_records(hypotheses, actions),
+                )
                 return hypotheses, [action for action in actions if action.kind in AGENT_ACTION_KINDS]
             parsed = normalize_agent_plan_payload(parse_llm_json_text(response_text))
             hypotheses = parse_agent_hypotheses(parsed.get("hypotheses"))
             actions = [action for action in parse_agent_actions(parsed.get("actions")) if action.kind in AGENT_ACTION_KINDS]
             if actions:
+                emit_verbose_llm_output(verbose, f"{stage_label} attempt {attempt + 1}", json.dumps(parsed, ensure_ascii=False))
                 return hypotheses, actions
+            hypotheses, actions = salvage_agent_plan_from_text(response_text, prompt)
+            if actions:
+                emit_verbose_llm_output(
+                    verbose,
+                    f"{stage_label} salvaged attempt {attempt + 1}",
+                    "\n".join(
+                        f"action|kind={action.kind}|target_or_query={action.query or action.path}|reason={action.reason}|limit={action.limit}|timeout_seconds={action.metadata.get('timeout_seconds', '') or '0'}"
+                        for action in actions
+                    ),
+                )
+                return hypotheses, [action for action in actions if action.kind in AGENT_ACTION_KINDS]
+            if verbose:
+                verbose_log(True, f"[{stage_label} attempt {attempt + 1}] suppressed non-structured prose output")
             last_error = RuntimeError("Ollama response did not include usable agent actions.")
         except Exception as exc:
+            salvage_text = response_text if "response_text" in locals() else previous_response
+            hypotheses, actions = salvage_agent_plan_from_text(salvage_text, prompt)
+            if actions:
+                emit_verbose_llm_output(
+                    verbose,
+                    f"{stage_label} salvaged attempt {attempt + 1}",
+                    "\n".join(
+                        f"action|kind={action.kind}|target_or_query={action.query or action.path}|reason={action.reason}|limit={action.limit}|timeout_seconds={action.metadata.get('timeout_seconds', '') or '0'}"
+                        for action in actions
+                    ),
+                )
+                return hypotheses, [action for action in actions if action.kind in AGENT_ACTION_KINDS]
             last_error = exc
             if is_ollama_transport_error(exc):
                 break
@@ -2054,6 +2290,8 @@ def request_agent_summary(
     model: str,
     prompt: dict[str, object],
     model_retries: int = 1,
+    timeout_seconds: int = 180,
+    verbose: bool = False,
 ) -> dict[str, object]:
     return request_structured_json(
         ollama_url,
@@ -2065,6 +2303,10 @@ def request_agent_summary(
             "executive_summary, priority_findings, relationships, review_order."
         ),
         max_retries=model_retries,
+        timeout_seconds=timeout_seconds,
+        salvage_response=salvage_summary_from_text,
+        verbose=verbose,
+        stage_label="agent-summary",
     )
 
 
@@ -2140,6 +2382,7 @@ def run_agent_mode(
             args.model,
             build_agent_plan_prompt(target, recon, findings[: args.max_llm_files], args.agent_max_actions),
             model_retries=args.model_retries,
+            timeout_seconds=args.ollama_timeout,
             verbose=args.verbose,
             stage_label="agent-plan-initial",
         )
@@ -2186,6 +2429,7 @@ def run_agent_mode(
                 max(0, args.agent_max_actions - len(actions)),
             ),
             model_retries=args.model_retries,
+            timeout_seconds=args.ollama_timeout,
             verbose=args.verbose,
             stage_label="agent-plan-refine",
         )
@@ -2257,6 +2501,8 @@ def run_agent_mode(
             args.model,
             llm_summary_prompt,
             model_retries=args.model_retries,
+            timeout_seconds=args.ollama_timeout,
+            verbose=args.verbose,
         )
     except RuntimeError as exc:
         warnings.append(f"agent summary failed: {exc}")
@@ -2290,6 +2536,7 @@ def generate_llm_summary(
     max_files: int,
     verbose: bool = False,
     model_retries: int = 1,
+    timeout_seconds: int = 180,
 ) -> dict[str, object]:
     selected_findings = select_llm_findings(findings, max_files)
     recon = build_llm_recon_context(target, findings, max_files)
@@ -2332,6 +2579,10 @@ def generate_llm_summary(
             "executive_summary, priority_findings, relationships, review_order."
         ),
         max_retries=model_retries,
+        timeout_seconds=timeout_seconds,
+        salvage_response=salvage_summary_from_text,
+        verbose=verbose,
+        stage_label="llm-summary",
     )
 
 
@@ -2355,6 +2606,9 @@ def run_scan(args: argparse.Namespace) -> int:
         return EXIT_USAGE
     if args.model_retries < 0:
         print("error: --model-retries must be >= 0", file=sys.stderr)
+        return EXIT_USAGE
+    if args.ollama_timeout < 1:
+        print("error: --ollama-timeout must be >= 1", file=sys.stderr)
         return EXIT_USAGE
     target = Path(args.target).expanduser().resolve()
     if not target.exists() or not target.is_dir():
@@ -2396,6 +2650,7 @@ def run_scan(args: argparse.Namespace) -> int:
                 args.max_llm_files,
                 verbose=args.verbose,
                 model_retries=args.model_retries,
+                timeout_seconds=args.ollama_timeout,
             )
             llm_summary = normalize_llm_summary(llm_summary)
             progress_log(args.verbose, "llm", "LLM summary completed")

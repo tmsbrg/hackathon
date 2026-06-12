@@ -22,6 +22,14 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("--model-retries must be >= 0", stderr.getvalue())
 
+    def test_scan_rejects_non_positive_ollama_timeout(self) -> None:
+        stderr = StringIO()
+        with mock.patch("sys.stderr", stderr):
+            exit_code = cli.main(["scan", "/tmp", "--no-llm", "--ollama-timeout", "0"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("--ollama-timeout must be >= 1", stderr.getvalue())
+
     def test_doctor_reports_missing_required_dependencies(self) -> None:
         stdout = StringIO()
         with mock.patch("sys.stdout", stdout):
