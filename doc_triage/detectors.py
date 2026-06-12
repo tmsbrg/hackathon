@@ -12,9 +12,11 @@ from .constants import (
     NOISE_PATTERNS,
     NOISE_PHRASES,
     SEVERITY_ORDER,
+    SENSITIVE_EXTENSIONS,
     SIGNAL_PATTERN_LABELS,
     SIGNAL_PATTERNS,
     SENSITIVE_FILENAMES,
+    SENSITIVE_PATH_SUFFIXES,
 )
 from .models import Finding
 
@@ -119,12 +121,22 @@ def relative_source(target: Path, file_path: Path) -> str:
 
 
 def filename_finding(target: Path, file_path: Path) -> Finding | None:
+    relative = relative_source(target, file_path)
     rule = SENSITIVE_FILENAMES.get(file_path.name.lower())
+    if rule is None:
+        lowered_relative = relative.lower()
+        for suffix, suffix_rule in SENSITIVE_PATH_SUFFIXES.items():
+            normalized_suffix = suffix.replace("\\", "/")
+            if lowered_relative.endswith(normalized_suffix):
+                rule = suffix_rule
+                break
+    if rule is None:
+        rule = SENSITIVE_EXTENSIONS.get(file_path.suffix.lower())
     if rule is None:
         return None
     category, severity = rule
     return Finding(
-        source=relative_source(target, file_path),
+        source=relative,
         category=category,
         severity=severity,
         detector="filename-rule",

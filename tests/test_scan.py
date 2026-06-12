@@ -51,6 +51,45 @@ class ScanLogicTests(unittest.TestCase):
 
         self.assertEqual(classification, ("credential", "high", 0.9))
 
+    def test_keyword_findings_detect_multilingual_password_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "config.txt"
+            path.write_text(
+                "mot de passe: bonjour123\n"
+                "contraseña=secreto123\n"
+                "пароль: qwerty123\n"
+                "密码: Zhongwen123\n"
+                "private_key=abc123secret\n",
+                encoding="utf-8",
+            )
+
+            findings = cli.keyword_findings(target, path, path.read_text(encoding="utf-8"))
+
+        detectors = {finding.detector for finding in findings}
+        self.assertIn("pattern:french-password-assignment", detectors)
+        self.assertIn("pattern:spanish-password-assignment", detectors)
+        self.assertIn("pattern:global-password-assignment", detectors)
+        self.assertIn("pattern:credential-field-assignment", detectors)
+
+    def test_keyword_findings_detect_multilingual_credential_and_username_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "directory.txt"
+            path.write_text(
+                "identifiants: analyste\n"
+                "aanmeldgegevens: vpn-user\n"
+                "ログイン情報: operator\n"
+                "gebruikersnaam: mulder\n",
+                encoding="utf-8",
+            )
+
+            findings = cli.keyword_findings(target, path, path.read_text(encoding="utf-8"))
+
+        detectors = {finding.detector for finding in findings}
+        self.assertIn("pattern:credentials-assignment", detectors)
+        self.assertIn("pattern:username-assignment", detectors)
+
     def test_deduplicate_findings_collapses_same_source_category_and_evidence(self) -> None:
         findings = [
             cli.Finding(
@@ -146,6 +185,41 @@ class ScanLogicTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         found_sources = {finding.source for finding in findings}
         self.assertTrue(set(cli.SENSITIVE_FILENAMES).issubset(found_sources))
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_marks_sensitive_path_suffixes(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            aws = target / ".aws" / "credentials"
+            kube = target / ".kube" / "config"
+            docker = target / ".docker" / "config.json"
+            for path in (aws, kube, docker):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("placeholder\n", encoding="utf-8")
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        found_sources = {finding.source for finding in findings}
+        self.assertIn(".aws/credentials", found_sources)
+        self.assertIn(".kube/config", found_sources)
+        self.assertIn(".docker/config.json", found_sources)
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_marks_sensitive_extensions(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            pem = target / "certificate.pem"
+            kdbx = target / "vault.kdbx"
+            for path in (pem, kdbx):
+                path.write_text("placeholder\n", encoding="utf-8")
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        found_sources = {finding.source for finding in findings}
+        self.assertIn("certificate.pem", found_sources)
+        self.assertIn("vault.kdbx", found_sources)
 
     def test_render_report_contains_expected_sections(self) -> None:
         args = cli.build_parser().parse_args(["scan", "/tmp/example", "--no-llm"])
