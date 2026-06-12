@@ -416,6 +416,33 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertEqual(ordered[0], "credential_hunter")
 
+    def test_prioritize_inconclusive_hypotheses_prefers_unevidenced_items(self) -> None:
+        hypotheses = [
+            cli.AgentHypothesis(label="credential lead", rationale="token clue", status="inconclusive", role="credential_hunter"),
+            cli.AgentHypothesis(
+                label="finance lead",
+                rationale="payroll clue",
+                status="inconclusive",
+                role="identity_reviewer",
+                evidence_paths=["Finance/payroll.xlsx"],
+            ),
+            cli.AgentHypothesis(label="closed lead", rationale="already proven", status="confirmed", role="document_analyst"),
+        ]
+        observations = [
+            cli.AgentObservation(
+                path="Finance/payroll.xlsx",
+                evidence="salary bands",
+                source_mechanism="file_info",
+                confidence=0.8,
+                role="identity_reviewer",
+                derived_claim="Finance document confirmed",
+            )
+        ]
+
+        ordered = cli.prioritize_inconclusive_hypotheses(hypotheses, observations)
+
+        self.assertEqual([item.role for item in ordered], ["credential_hunter", "identity_reviewer"])
+
     @mock.patch("doc_triage.cli.request_agent_coordination")
     def test_run_agent_mode_applies_coordinator_updates(self, request_agent_coordination: mock.Mock) -> None:
         request_agent_coordination.return_value = [
@@ -1727,6 +1754,76 @@ class AgentModeTests(unittest.TestCase):
             rendered.index("Executing follow-up subagent credential_hunter actions"),
             rendered.index("Executing follow-up subagent identity_reviewer actions"),
         )
+
+    @mock.patch("doc_triage.cli.request_agent_summary", return_value={"executive_summary": "done", "priority_findings": [], "relationships": [], "review_order": []})
+    @mock.patch("doc_triage.cli.request_agent_coordination", return_value=[])
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    @mock.patch("doc_triage.cli.execute_agent_actions")
+    def test_run_agent_mode_executes_verification_pass_for_remaining_inconclusive_hypothesis(
+        self,
+        execute_agent_actions: mock.Mock,
+        request_agent_plan: mock.Mock,
+        _: mock.Mock,
+        __: mock.Mock,
+    ) -> None:
+        request_agent_plan.side_effect = [
+            (
+                [cli.AgentHypothesis(label="check vpn", rationale="possible token reuse", role="credential_hunter")],
+                [cli.AgentAction(kind="read_head", path="notes.txt", reason="inspect initial note", role="document_analyst")],
+            ),
+            (
+                [],
+                [],
+            ),
+            (
+                [],
+                [],
+            ),
+            (
+                [],
+                [cli.AgentAction(kind="content_search", query="vpn", reason="verify token reuse hypothesis", role="credential_hunter")],
+            ),
+        ]
+        execute_agent_actions.side_effect = [
+            (
+                [
+                    cli.AgentObservation(
+                        path="notes.txt",
+                        evidence="project note references remote access issues",
+                        source_mechanism="read_head",
+                        confidence=0.4,
+                        role="document_analyst",
+                        derived_claim="Document may be relevant to access troubleshooting",
+                    )
+                ],
+                [],
+            ),
+            (
+                [
+                    cli.AgentObservation(
+                        path="vpn.txt",
+                        evidence="vpn token reset instructions",
+                        source_mechanism="content_search",
+                        confidence=0.9,
+                        role="credential_hunter",
+                        derived_claim="Confirmed VPN token material",
+                    )
+                ],
+                [],
+            ),
+        ]
+        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--agent"])
+        stdout = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stdout(stdout):
+            target = Path(tmpdir)
+            (target / "notes.txt").write_text("project note references remote access issues\n", encoding="utf-8")
+            run = cli.run_agent_mode(target, [], args)
+
+        rendered = stdout.getvalue()
+        self.assertIn("Planning verification actions for hypothesis", rendered)
+        self.assertIn("Executing verification subagent credential_hunter actions", rendered)
+        self.assertTrue(any(action.kind == "content_search" and action.query == "vpn" for action in run.actions))
+        self.assertTrue(any(observation.role == "credential_hunter" for observation in run.observations))
 
 
 if __name__ == "__main__":

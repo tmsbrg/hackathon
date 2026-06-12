@@ -260,6 +260,36 @@ def sort_action_groups_by_role_priority(
     )
 
 
+def prioritize_inconclusive_hypotheses(
+    hypotheses: Sequence[AgentHypothesis],
+    observations: Sequence[AgentObservation],
+) -> list[AgentHypothesis]:
+    ranked: list[tuple[int, int, AgentHypothesis]] = []
+    for index, hypothesis in enumerate(hypotheses):
+        if hypothesis.status != "inconclusive":
+            continue
+        score = 0
+        score += 5
+        if not hypothesis.evidence_paths:
+            score += 2
+        matching_observations = 0
+        for observation in observations:
+            if hypothesis_support_score(hypothesis, observation) > 0:
+                matching_observations += 1
+                if observation.confidence >= 0.8:
+                    score += 1
+        if matching_observations == 0:
+            score += 2
+        ranked.append((score, -index, hypothesis))
+    return [
+        hypothesis
+        for _, _, hypothesis in sorted(
+            ranked,
+            key=lambda item: (-item[0], item[1]),
+        )
+    ]
+
+
 def infer_observation_handoff_targets(observation: AgentObservation) -> list[tuple[str, str]]:
     combined = " ".join(
         part for part in (observation.path, observation.evidence, observation.derived_claim, observation.source_mechanism) if part
@@ -3692,6 +3722,77 @@ def plan_hypothesis_fanout_actions(
     return additional_hypotheses, additional_actions, warnings
 
 
+def plan_inconclusive_hypothesis_checks(
+    target: Path,
+    recon: dict[str, object],
+    findings: list[Finding],
+    observations: list[AgentObservation],
+    hypotheses: Sequence[AgentHypothesis],
+    existing_actions: Sequence[AgentAction],
+    args: argparse.Namespace,
+) -> tuple[list[AgentHypothesis], list[AgentAction], list[str]]:
+    warnings: list[str] = []
+    additional_hypotheses: list[AgentHypothesis] = []
+    additional_actions: list[AgentAction] = []
+    remaining_budget = max(0, args.agent_max_actions - len(existing_actions))
+    if remaining_budget <= 0:
+        return additional_hypotheses, additional_actions, warnings
+
+    ranked_hypotheses = prioritize_inconclusive_hypotheses(hypotheses, observations)
+    seeded_actions = deduplicate_agent_actions(list(existing_actions))
+    action_keys = {(action.kind, action.path, action.query, action.code) for action in seeded_actions}
+    hypotheses_seen = {(item.role, item.label, item.rationale) for item in hypotheses}
+
+    for index, hypothesis in enumerate(ranked_hypotheses[:3], start=1):
+        remaining_budget = max(0, args.agent_max_actions - len(existing_actions) - len(additional_actions))
+        if remaining_budget <= 0:
+            break
+        role = hypothesis.role.strip() or infer_agent_role(hypothesis.label, hypothesis.rationale)
+        try:
+            progress_log(
+                args.verbose,
+                "agent",
+                f"Planning verification actions for hypothesis {index}/{min(3, len(ranked_hypotheses))} with subagent {role}",
+            )
+            focused_hypotheses, focused_actions = request_agent_plan(
+                args.ollama_url,
+                args.model,
+                build_hypothesis_focus_prompt(
+                    target,
+                    recon,
+                    findings[: args.max_llm_files],
+                    observations,
+                    hypothesis,
+                    list(existing_actions) + additional_actions,
+                    remaining_budget,
+                ),
+                model_retries=args.model_retries,
+                timeout_seconds=args.ollama_timeout,
+                verbose=args.debug,
+                stage_label=f"agent-plan-hypothesis-{role}-{index}",
+            )
+        except Exception as exc:
+            warnings.append(f"agent hypothesis verification planning failed for {role}:{hypothesis.label}: {exc}")
+            continue
+        for focused_hypothesis in focused_hypotheses:
+            focused_hypothesis.role = focused_hypothesis.role or role
+            key = (focused_hypothesis.role, focused_hypothesis.label, focused_hypothesis.rationale)
+            if key in hypotheses_seen:
+                continue
+            hypotheses_seen.add(key)
+            additional_hypotheses.append(focused_hypothesis)
+        for action in deduplicate_agent_actions(focused_actions):
+            action.role = action.role or role
+            key = (action.kind, action.path, action.query, action.code)
+            if key in action_keys:
+                continue
+            action_keys.add(key)
+            additional_actions.append(action)
+            if len(additional_actions) >= remaining_budget:
+                break
+    return additional_hypotheses, additional_actions, warnings
+
+
 def build_agent_plan_prompt(
     target: Path,
     recon: dict[str, object],
@@ -4223,6 +4324,64 @@ def run_agent_mode(
         warnings.append(f"agent coordinator failed: {exc}")
         all_hypotheses = coordinator_updates
         progress_log(args.verbose, "agent", f"Coordinator review failed; using deterministic status updates ({exc})")
+
+    verification_observations: list[AgentObservation] = []
+    verification_warnings: list[str] = []
+    verification_hypotheses: list[AgentHypothesis] = []
+    verification_actions: list[AgentAction] = []
+    verification_budget = max(0, args.agent_max_actions - len(actions))
+    if verification_budget > 0:
+        verification_hypotheses, verification_actions, hypothesis_check_warnings = plan_inconclusive_hypothesis_checks(
+            target,
+            recon,
+            findings,
+            observations,
+            all_hypotheses,
+            actions,
+            args,
+        )
+        warnings.extend(hypothesis_check_warnings)
+        if verification_hypotheses:
+            all_hypotheses = [*all_hypotheses, *verification_hypotheses]
+        if verification_actions:
+            progress_log(
+                args.verbose,
+                "agent",
+                "Verification plan summary: "
+                + summarize_agent_plan_natural_language(verification_hypotheses or all_hypotheses, verification_actions),
+            )
+            for summary in build_role_plan_summary(verification_hypotheses or all_hypotheses, verification_actions):
+                progress_log(args.verbose, "agent", f"Verification subagent plan: {summary}")
+            grouped_verification = sort_action_groups_by_role_priority(
+                group_actions_by_role(verification_actions),
+                prioritize_roles_for_followup(all_hypotheses, verification_actions, observations),
+            )
+            for role, role_actions in grouped_verification:
+                progress_log(
+                    args.verbose,
+                    "agent",
+                    f"Executing verification subagent {role} actions ({len(role_actions)}): {', '.join(summarize_agent_action(action) for action in role_actions[:4])}",
+                )
+                role_observations, role_warnings = execute_agent_actions(
+                    target,
+                    role_actions,
+                    args.agent_timeout,
+                    ollama_url=args.ollama_url,
+                    model=args.model,
+                    model_retries=args.model_retries,
+                    verbose=args.verbose,
+                )
+                verification_observations.extend(role_observations)
+                verification_warnings.extend(role_warnings)
+            warnings.extend(verification_warnings)
+            actions.extend(verification_actions)
+            observations.extend(verification_observations)
+            progress_log(
+                args.verbose,
+                "agent",
+                f"Verification actions produced {len(verification_observations)} observations and {len(verification_warnings)} warnings",
+            )
+            all_hypotheses = coordinate_hypotheses_deterministically(all_hypotheses, observations)
 
     reviewed_findings, removed_findings = review_false_positives(
         args.ollama_url,
