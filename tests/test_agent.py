@@ -12,9 +12,15 @@ from doc_triage import cli
 
 
 class AgentModeTests(unittest.TestCase):
-    def test_scan_rejects_agent_with_no_llm(self) -> None:
+    def test_scan_rejects_multi_agent_with_no_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             exit_code = cli.main(["scan", tmpdir, "--multi-agent", "--no-llm"])
+
+        self.assertEqual(exit_code, cli.EXIT_USAGE)
+
+    def test_scan_rejects_single_agent_with_no_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exit_code = cli.main(["scan", tmpdir, "--agent", "--no-llm"])
 
         self.assertEqual(exit_code, cli.EXIT_USAGE)
 
@@ -67,7 +73,7 @@ class AgentModeTests(unittest.TestCase):
             cli.ToolStatus("ollama", "/usr/bin/ollama", False),
         ],
     )
-    def test_default_llm_path_runs_single_agent_mode(
+    def test_single_agent_flag_runs_single_agent_mode(
         self,
         _: mock.Mock,
         __: mock.Mock,
@@ -81,10 +87,44 @@ class AgentModeTests(unittest.TestCase):
             (target / "plain.txt").write_text("hello\n", encoding="utf-8")
             output = Path(tmpdir, "report.md")
 
-            exit_code = cli.main(["scan", str(target), "--output", str(output)])
+            exit_code = cli.main(["scan", str(target), "--output", str(output), "--agent"])
 
         self.assertEqual(exit_code, cli.EXIT_OK)
         run_single_agent_mode.assert_called_once()
+        run_agent_mode.assert_not_called()
+
+    @mock.patch("doc_triage.cli.run_agent_mode")
+    @mock.patch("doc_triage.cli.run_single_agent_mode")
+    @mock.patch("doc_triage.cli.scan_target", return_value=([], []))
+    @mock.patch(
+        "doc_triage.cli.detect_tools",
+        return_value=[
+            cli.ToolStatus("rg", "/usr/bin/rg", True),
+            cli.ToolStatus("rga", "/usr/bin/rga", True),
+            cli.ToolStatus("trufflehog", "/usr/bin/trufflehog", True),
+            cli.ToolStatus("tesseract", "/usr/bin/tesseract", False),
+            cli.ToolStatus("ocrmypdf", "/usr/bin/ocrmypdf", False),
+            cli.ToolStatus("pdftotext", "/usr/bin/pdftotext", False),
+            cli.ToolStatus("ollama", "/usr/bin/ollama", False),
+        ],
+    )
+    def test_default_scan_stays_deterministic_only(
+        self,
+        _: mock.Mock,
+        __: mock.Mock,
+        run_single_agent_mode: mock.Mock,
+        run_agent_mode: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, "case")
+            target.mkdir()
+            (target / "plain.txt").write_text("hello\n", encoding="utf-8")
+            output = Path(tmpdir, "report.md")
+
+            exit_code = cli.main(["scan", str(target), "--output", str(output)])
+
+        self.assertEqual(exit_code, cli.EXIT_OK)
+        run_single_agent_mode.assert_not_called()
         run_agent_mode.assert_not_called()
 
     def test_build_agent_recon_context_samples_representative_files(self) -> None:

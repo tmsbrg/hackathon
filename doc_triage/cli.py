@@ -1029,12 +1029,15 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--exclude", action="append", default=[])
     scan.add_argument("--no-llm", action="store_true")
     scan.add_argument(
+        "--agent",
+        action="store_true",
+        help="Enable the single-agent plan/do/check/act loop.",
+    )
+    scan.add_argument(
         "--multi-agent",
-        dest="agent",
         action="store_true",
         help="Enable the multi-agent subagent planning and investigation flow.",
     )
-    scan.add_argument("--agent", dest="legacy_agent", action="store_true", help=argparse.SUPPRESS)
     scan.add_argument("--agent-max-actions", type=int, default=8)
     scan.add_argument("--agent-timeout", type=int, default=30)
     scan.add_argument("--model-retries", type=int, default=1)
@@ -5219,11 +5222,12 @@ def summarize_hypothesis_branches_for_llm(
 
 
 def run_scan(args: argparse.Namespace) -> int:
-    if getattr(args, "legacy_agent", False):
-        print("error: --agent has been replaced by --multi-agent", file=sys.stderr)
+    if args.agent and args.multi_agent:
+        print("error: --agent and --multi-agent are mutually exclusive", file=sys.stderr)
         return EXIT_USAGE
-    if args.agent and args.no_llm:
-        print("error: --multi-agent requires LLM mode and cannot be used with --no-llm", file=sys.stderr)
+    if (args.agent or args.multi_agent) and args.no_llm:
+        flag = "--multi-agent" if args.multi_agent else "--agent"
+        print(f"error: {flag} requires LLM mode and cannot be used with --no-llm", file=sys.stderr)
         return EXIT_USAGE
     if args.model_retries < 0:
         print("error: --model-retries must be >= 0", file=sys.stderr)
@@ -5255,14 +5259,14 @@ def run_scan(args: argparse.Namespace) -> int:
     progress_log(args.verbose, "scan", f"Deterministic scan produced {len(findings)} findings and {len(warnings)} warnings")
     agent_run: AgentRun | None = None
     llm_summary: dict[str, object] | None = None
-    if args.agent:
+    if args.multi_agent:
         progress_log(args.verbose, "agent", f"Running agent mode with up to {args.agent_max_actions} actions")
         agent_run = run_agent_mode(target, findings, args, exclude_globs=exclude_globs)
         if agent_run.reviewed_findings:
             findings = agent_run.reviewed_findings
         llm_summary = agent_run.llm_summary
         warnings.extend(agent_run.warnings)
-    elif not args.no_llm:
+    elif args.agent:
         progress_log(args.verbose, "llm", "Running single-agent plan/do/check/act loop")
         agent_run = run_single_agent_mode(target, findings, args, exclude_globs=exclude_globs)
         if agent_run.reviewed_findings:
@@ -5271,8 +5275,10 @@ def run_scan(args: argparse.Namespace) -> int:
         warnings.extend(agent_run.warnings)
     elif args.no_llm:
         progress_log(args.verbose, "llm", "LLM summary disabled with --no-llm")
+    else:
+        progress_log(args.verbose, "llm", "Skipping LLM modes; running deterministic scan only")
 
-    display_agent_run = agent_run if args.agent else None
+    display_agent_run = agent_run if args.multi_agent else None
     report = render_report(args, target, findings, warnings, llm_summary=llm_summary, agent_run=display_agent_run)
     write_report(output_path, report)
     progress_log(args.verbose, "report", "Report written successfully")

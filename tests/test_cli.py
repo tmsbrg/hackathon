@@ -33,15 +33,20 @@ class CliContractTests(unittest.TestCase):
     def test_scan_accepts_multi_agent_flag(self) -> None:
         args = cli.build_parser().parse_args(["scan", "/tmp", "--multi-agent"])
 
+        self.assertTrue(args.multi_agent)
+
+    def test_scan_accepts_single_agent_flag(self) -> None:
+        args = cli.build_parser().parse_args(["scan", "/tmp", "--agent"])
+
         self.assertTrue(args.agent)
 
-    def test_scan_rejects_legacy_agent_flag(self) -> None:
+    def test_scan_rejects_both_agent_modes(self) -> None:
         stderr = StringIO()
         with mock.patch("sys.stderr", stderr):
-            exit_code = cli.main(["scan", "/tmp", "--agent"])
+            exit_code = cli.main(["scan", "/tmp", "--agent", "--multi-agent"])
 
         self.assertEqual(exit_code, 2)
-        self.assertIn("--agent has been replaced by --multi-agent", stderr.getvalue())
+        self.assertIn("--agent and --multi-agent are mutually exclusive", stderr.getvalue())
 
     def test_doctor_reports_missing_required_dependencies(self) -> None:
         stdout = StringIO()

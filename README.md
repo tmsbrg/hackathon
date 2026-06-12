@@ -45,6 +45,7 @@ doc-triage scan TARGET
   [--max-llm-files N]
   [--exclude GLOB]
   [--no-llm]
+  [--agent]
   [--multi-agent]
   [--agent-max-actions N]
   [--agent-timeout SECONDS]
@@ -73,22 +74,22 @@ doc-triage doctor
 Run a deterministic scan:
 
 ```bash
-doc-triage scan /path/to/share --output report.md --no-llm
+doc-triage scan /path/to/share --output report.md
 ```
 
 Run with OCR:
 
 ```bash
-doc-triage scan /path/to/share --output report.md --ocr --no-llm
+doc-triage scan /path/to/share --output report.md --ocr
 ```
 
-Run with the local model summary path:
+Run the single-agent plan/do/check/act loop:
 
 ```bash
-doc-triage scan /path/to/share --output report.md --model huihui_ai/qwen3.5-abliterated:9b
+doc-triage scan /path/to/share --output report.md --agent --model huihui_ai/qwen3.5-abliterated:9b
 ```
 
-Run the agent loop with verbose planning output:
+Run the multi-agent subagent flow with verbose planning output:
 
 ```bash
 doc-triage --verbose scan /path/to/share \
