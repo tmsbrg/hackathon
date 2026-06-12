@@ -83,6 +83,10 @@ NOISE_PHRASES = (
     "can you find",
     "hint:",
 )
+NOISE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:password|passwd|pwd|wachtwoord)\b\s*[:=]\s*(?:notused|changeme|password123|test1234)\b", re.IGNORECASE),
+    re.compile(r"\b(?:retired|deprecated|legacy only)\b", re.IGNORECASE),
+)
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 ANSI_RESET = "\033[0m"
 ANSI_COLORS = {

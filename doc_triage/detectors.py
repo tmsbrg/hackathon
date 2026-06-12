@@ -9,6 +9,7 @@ from typing import Sequence
 
 from .constants import (
     DOC_NOISE_FILENAMES,
+    NOISE_PATTERNS,
     NOISE_PHRASES,
     SEVERITY_ORDER,
     SIGNAL_PATTERN_LABELS,
@@ -68,6 +69,10 @@ def classify_match(text: str, source: str = "") -> tuple[str, str, float] | None
     lowered = stripped.lower()
     source_name = Path(source).name.lower() if source else ""
 
+    for pattern in NOISE_PATTERNS:
+        if pattern.search(stripped):
+            return None
+
     for pattern, rule in SIGNAL_PATTERNS:
         if pattern.search(stripped):
             return rule
@@ -88,6 +93,10 @@ def classify_match_with_detector(text: str, source: str = "") -> tuple[str, str,
     stripped = text.strip()
     lowered = stripped.lower()
     source_name = Path(source).name.lower() if source else ""
+
+    for pattern in NOISE_PATTERNS:
+        if pattern.search(stripped):
+            return None
 
     for index, (pattern, rule) in enumerate(SIGNAL_PATTERNS):
         if pattern.search(stripped):

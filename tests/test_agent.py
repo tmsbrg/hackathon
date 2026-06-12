@@ -205,6 +205,20 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].metadata["timeout_seconds"], "7")
 
+    def test_parse_agent_actions_normalizes_read_head_email_target(self) -> None:
+        actions = cli.parse_agent_actions([{"kind": "read_head", "path": "IT/tickets/helpdesk_reset_vandenberg.eml"}])
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "email_parse")
+
+    def test_parse_agent_actions_normalizes_virtual_archive_target(self) -> None:
+        actions = cli.parse_agent_actions([{"kind": "read_head", "path": "Archives/2020/project_legacy_2020.zip::config.ini"}])
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "zip_list")
+        self.assertEqual(actions[0].path, "Archives/2020/project_legacy_2020.zip")
+        self.assertEqual(actions[0].metadata["virtual_target"], "config.ini")
+
     def test_parse_agent_actions_rejects_sentence_as_file_target(self) -> None:
         actions = cli.parse_agent_actions(
             [
@@ -217,6 +231,34 @@ class AgentModeTests(unittest.TestCase):
         )
 
         self.assertEqual(actions, [])
+
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    def test_plan_hypothesis_fanout_actions_adds_unique_actions(self, request_agent_plan: mock.Mock) -> None:
+        request_agent_plan.return_value = (
+            [cli.AgentHypothesis(label="archive lead", rationale="Check archives")],
+            [
+                cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="Inspect archive"),
+                cli.AgentAction(kind="zip_list", path="Archives/2020/project_legacy_2020.zip", reason="duplicate"),
+            ],
+        )
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        hypotheses = [cli.AgentHypothesis(label="archive lead", rationale="Check archives")]
+        existing = [cli.AgentAction(kind="dir_list", path="Archives", reason="Survey archives")]
+
+        focused_hypotheses, actions, warnings = cli.plan_hypothesis_fanout_actions(
+            Path("/tmp/case"),
+            {"representative_heads": []},
+            [],
+            [],
+            hypotheses,
+            existing,
+            args,
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "zip_list")
+        self.assertEqual(focused_hypotheses, [])
 
     def test_parse_agent_actions_normalizes_zip_list_directory_target(self) -> None:
         actions = cli.parse_agent_actions(
@@ -246,6 +288,17 @@ class AgentModeTests(unittest.TestCase):
             for name, expected in samples.items():
                 with self.subTest(name=name):
                     self.assertEqual(cli.classify_agent_target(target / name), expected)
+
+    def test_classify_agent_target_supports_all_documented_archive_extensions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            samples = [f"archive{suffix}" for suffix in sorted(cli.ARCHIVE_EXTENSIONS)]
+            for name in samples:
+                (target / name).write_bytes(b"x")
+
+            for name in samples:
+                with self.subTest(name=name):
+                    self.assertEqual(cli.classify_agent_target(target / name), "archive")
 
     def test_parse_agent_actions_strips_trailing_query_fields_from_path(self) -> None:
         actions = cli.parse_agent_actions(
@@ -1209,12 +1262,14 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(run.actions), 2)
         self.assertEqual(run.actions[1].kind, "dir_list")
 
+    @mock.patch("doc_triage.cli.request_agent_summary", return_value={"executive_summary": "done", "priority_findings": [], "relationships": [], "review_order": []})
     @mock.patch("doc_triage.cli.request_agent_plan", side_effect=RuntimeError("bad json"))
     @mock.patch("doc_triage.cli.execute_agent_actions")
     def test_run_agent_mode_falls_back_when_initial_planning_fails(
         self,
         execute_agent_actions: mock.Mock,
         _: mock.Mock,
+        __: mock.Mock,
     ) -> None:
         execute_agent_actions.side_effect = [([], []), ([], [])]
         args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])

@@ -79,6 +79,18 @@ class ScanLogicTests(unittest.TestCase):
             self.assertEqual(findings[0].category, "sensitive-file")
 
     @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_ignores_office_lockfiles(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            lockfile = target / "~$VPN_toegang_2024.docx"
+            lockfile.write_bytes(b"not a zip")
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+            self.assertEqual(findings, [])
+            self.assertEqual(warnings, [])
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
     def test_scan_target_does_not_flag_generic_secret_titles(self, _: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)
