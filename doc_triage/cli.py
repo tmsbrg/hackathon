@@ -555,8 +555,11 @@ def parse_agent_actions(payload: object) -> list[AgentAction]:
         code = str(item.get("code") or "").strip()
         reason = str(item.get("reason") or item.get("why") or item.get("description") or "").strip()
         limit = item.get("limit", 20)
+        timeout_seconds = item.get("timeout_seconds", item.get("timeout"))
         if not isinstance(limit, int):
             limit = 20
+        if not isinstance(timeout_seconds, int):
+            timeout_seconds = 0
         if not kind:
             continue
         if kind in {"content_search", "filename_search"} and not query:
@@ -584,9 +587,18 @@ def parse_agent_actions(payload: object) -> list[AgentAction]:
                 query=query,
                 limit=max(1, min(limit, 50)),
                 code=code,
+                metadata={"timeout_seconds": str(max(0, min(timeout_seconds, 300)))} if timeout_seconds else {},
             )
         )
     return actions
+
+
+def resolve_action_timeout(action: AgentAction, max_timeout: int) -> int:
+    configured = action.metadata.get("timeout_seconds", "").strip()
+    if configured.isdigit():
+        return max(1, min(int(configured), max_timeout))
+    kind_default = AGENT_ACTION_TIMEOUT_DEFAULTS.get(action.kind, max_timeout)
+    return max(1, min(kind_default, max_timeout))
 
 
 def deduplicate_agent_actions(actions: list[AgentAction]) -> list[AgentAction]:
@@ -845,6 +857,17 @@ AGENT_ACTION_KINDS = {
     "filename_search",
     "generated_python_helper",
 }
+AGENT_ACTION_TIMEOUT_DEFAULTS = {
+    "read_head": 5,
+    "dir_list": 5,
+    "file_info": 5,
+    "strings_head": 15,
+    "filename_search": 15,
+    "zip_list": 20,
+    "content_search": 20,
+    "pdf_text_head": 25,
+    "generated_python_helper": 30,
+}
 
 
 def validate_generated_helper_source(source: str) -> list[str]:
@@ -1037,13 +1060,21 @@ def execute_generated_helper(
                 observation.truncated = result.metadata.get("stdout_truncated", False) or observation.truncated
                 observation.exit_status = result.exit_code
                 observation.metadata["helper_source_hash"] = source_hash
+                observation.metadata["timeout_seconds"] = str(timeout_seconds)
             warnings.extend(parse_warnings)
             if result.exit_code == 0:
                 return observations, warnings
 
-            failure_reason = f"generated helper failed in sandbox: {result.stderr.strip() or result.stdout.strip() or 'unknown error'}"
+            if result.timed_out:
+                failure_reason = f"generated helper timed out after {timeout_seconds}s"
+            else:
+                failure_reason = f"generated helper failed in sandbox: {result.stderr.strip() or result.stdout.strip() or 'unknown error'}"
             if attempt >= model_retries or not ollama_url or not model:
-                warnings.append("generated helper failed in sandbox")
+                warnings.append(
+                    f"generated helper timed out after {timeout_seconds}s"
+                    if result.timed_out
+                    else "generated helper failed in sandbox"
+                )
                 return observations, warnings
             verbose_log(verbose, f"Retrying generated helper after sandbox failure ({attempt + 1}/{model_retries})")
             repaired_action = request_generated_helper_repair(
@@ -1086,6 +1117,7 @@ def execute_agent_actions(
     observations: list[AgentObservation] = []
     warnings: list[str] = []
     for action in deduplicate_agent_actions(actions):
+        action_timeout = resolve_action_timeout(action, per_action_timeout)
         if action.kind not in AGENT_ACTION_KINDS:
             warnings.append(f"unsupported agent action: {action.kind}")
             continue
@@ -1095,7 +1127,7 @@ def execute_agent_actions(
                 generated_observations, helper_warnings = execute_generated_helper(
                     target,
                     action,
-                    per_action_timeout,
+                    action_timeout,
                     ollama_url=ollama_url,
                     model=model,
                     model_retries=model_retries,
@@ -1113,6 +1145,7 @@ def execute_agent_actions(
                         source_mechanism="dir_list",
                         confidence=0.5,
                         derived_claim=action.reason,
+                        metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
                 continue
@@ -1125,10 +1158,11 @@ def execute_agent_actions(
                         source_mechanism="read_head",
                         confidence=0.7,
                         derived_claim=action.reason,
+                        metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
             elif action.kind == "strings_head" and candidate is not None and candidate.is_file():
-                result = run_command(["strings", "-n", "6", str(candidate)], timeout=per_action_timeout, max_output_chars=4000)
+                result = run_command(["strings", "-n", "6", str(candidate)], timeout=action_timeout, max_output_chars=4000)
                 observations.append(
                     normalize_agent_observation(
                         path=relative_source(target, candidate),
@@ -1138,10 +1172,13 @@ def execute_agent_actions(
                         derived_claim=action.reason,
                         truncated=result.metadata.get("stdout_truncated", False),
                         exit_status=result.exit_code,
+                        metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
+                if result.timed_out:
+                    warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
             elif action.kind == "zip_list" and candidate is not None and candidate.is_file():
-                result = run_command(["unzip", "-l", str(candidate)], timeout=per_action_timeout, max_output_chars=4000)
+                result = run_command(["unzip", "-l", str(candidate)], timeout=action_timeout, max_output_chars=4000)
                 observations.append(
                     normalize_agent_observation(
                         path=relative_source(target, candidate),
@@ -1151,12 +1188,15 @@ def execute_agent_actions(
                         derived_claim=action.reason,
                         truncated=result.metadata.get("stdout_truncated", False),
                         exit_status=result.exit_code,
+                        metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
+                if result.timed_out:
+                    warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
             elif action.kind == "pdf_text_head" and candidate is not None and candidate.is_file():
                 with tempfile.TemporaryDirectory(prefix="doc-triage-agent-pdf-") as temp_dir:
                     text_path = Path(temp_dir) / f"{candidate.stem}.txt"
-                    result = run_command(["pdftotext", str(candidate), str(text_path)], timeout=per_action_timeout, max_output_chars=2000)
+                    result = run_command(["pdftotext", str(candidate), str(text_path)], timeout=action_timeout, max_output_chars=2000)
                     evidence = result.stderr or "pdftotext failed"
                     if result.exit_code == 0 and text_path.exists():
                         evidence = text_path.read_text(encoding="utf-8", errors="ignore")[: min(action.limit * 120, 4000)]
@@ -1168,10 +1208,13 @@ def execute_agent_actions(
                             confidence=0.6,
                             derived_claim=action.reason,
                             exit_status=result.exit_code,
+                            metadata={"timeout_seconds": str(action_timeout)},
                         )
                     )
+                    if result.timed_out:
+                        warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
             elif action.kind == "file_info" and candidate is not None:
-                result = run_command(["file", "-b", str(candidate)], timeout=per_action_timeout, max_output_chars=1000)
+                result = run_command(["file", "-b", str(candidate)], timeout=action_timeout, max_output_chars=1000)
                 observations.append(
                     normalize_agent_observation(
                         path=relative_source(target, candidate),
@@ -1180,8 +1223,11 @@ def execute_agent_actions(
                         confidence=0.55,
                         derived_claim=action.reason,
                         exit_status=result.exit_code,
+                        metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
+                if result.timed_out:
+                    warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
             elif action.kind == "dir_list" and candidate is not None and candidate.is_dir():
                 entries = sorted(path.name for path in candidate.iterdir())[: action.limit]
                 observations.append(
@@ -1191,12 +1237,13 @@ def execute_agent_actions(
                         source_mechanism="dir_list",
                         confidence=0.5,
                         derived_claim=action.reason,
+                        metadata={"timeout_seconds": str(action_timeout)},
                     )
                 )
             elif action.kind == "content_search":
                 result = run_command(
                     ["rga", "-n", action.query, str(target)],
-                    timeout=per_action_timeout,
+                    timeout=action_timeout,
                     max_output_chars=6000,
                 )
                 for match_path, line_no, evidence in parse_content_search_output(result.stdout)[: action.limit]:
@@ -1207,15 +1254,20 @@ def execute_agent_actions(
                             source_mechanism="content_search",
                             confidence=0.75,
                             derived_claim=action.reason,
-                            metadata={"line": str(line_no) if line_no is not None else ""},
+                            metadata={
+                                "line": str(line_no) if line_no is not None else "",
+                                "timeout_seconds": str(action_timeout),
+                            },
                             exit_status=result.exit_code,
                             truncated=result.metadata.get("stdout_truncated", False),
                         )
                     )
+                if result.timed_out:
+                    warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.query or action.path}")
             elif action.kind == "filename_search":
                 result = run_command(
                     ["rg", "--files", str(target), "-g", action.query],
-                    timeout=per_action_timeout,
+                    timeout=action_timeout,
                     max_output_chars=6000,
                 )
                 for line in result.stdout.splitlines()[: action.limit]:
@@ -1228,8 +1280,11 @@ def execute_agent_actions(
                             derived_claim=action.reason,
                             exit_status=result.exit_code,
                             truncated=result.metadata.get("stdout_truncated", False),
+                            metadata={"timeout_seconds": str(action_timeout)},
                         )
                     )
+                if result.timed_out:
+                    warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.query or action.path}")
             else:
                 warnings.append(f"agent action skipped unsupported target: {action.kind} {action.path}")
         except OSError as exc:

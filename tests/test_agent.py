@@ -145,6 +145,12 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].path, "docs")
 
+    def test_parse_agent_actions_preserves_timeout_override(self) -> None:
+        actions = cli.parse_agent_actions([{"kind": "content_search", "query": "token", "timeout_seconds": 7}])
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].metadata["timeout_seconds"], "7")
+
     def test_merge_agent_actions_backfills_with_fallback(self) -> None:
         merged = cli.merge_agent_actions(
             [cli.AgentAction(kind="dir_list", path=".", reason="planned")],
@@ -176,6 +182,46 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0].path, "alpha.txt")
         self.assertEqual(observations[0].source_mechanism, "content_search")
+        self.assertEqual(observations[0].metadata["timeout_seconds"], "5")
+
+    @mock.patch("doc_triage.cli.run_command")
+    def test_execute_agent_actions_uses_individual_timeout_override(self, run_command: mock.Mock) -> None:
+        run_command.return_value = cli.CommandResult(
+            exit_code=0,
+            stdout="alpha.txt:2:token=secret\n",
+            stderr="",
+            timed_out=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="content_search", query="token", reason="look", metadata={"timeout_seconds": "2"})],
+                per_action_timeout=30,
+            )
+
+        self.assertEqual(run_command.call_args.kwargs["timeout"], 2)
+
+    @mock.patch("doc_triage.cli.run_command")
+    def test_execute_agent_actions_warns_on_timeout(self, run_command: mock.Mock) -> None:
+        run_command.return_value = cli.CommandResult(
+            exit_code=1,
+            stdout="",
+            stderr="",
+            timed_out=True,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="content_search", query="token", reason="look", metadata={"timeout_seconds": "2"})],
+                per_action_timeout=30,
+            )
+
+        self.assertEqual(observations, [])
+        self.assertIn("timed out after 2s", " ".join(warnings))
 
     def test_execute_agent_actions_treats_read_head_directory_as_dir_list(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
