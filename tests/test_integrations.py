@@ -185,6 +185,24 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("!ANSWER.txt", seen_rga_command)
         self.assertIn("!README.txt", seen_rga_command)
 
+    @mock.patch("doc_triage.cli.run_command")
+    def test_run_external_scanners_ignores_rga_adapter_failures(self, run_command: mock.Mock) -> None:
+        run_command.side_effect = [
+            cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False),
+            cli.CommandResult(
+                exit_code=2,
+                stdout="",
+                stderr="rg: sample.pdf: preprocessor command failed",
+                timed_out=False,
+            ),
+            cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False),
+        ]
+
+        findings, warnings = cli.run_external_scanners(Path("/tmp/case"))
+
+        self.assertEqual(findings, [])
+        self.assertEqual(warnings, [])
+
     def test_render_priority_item_uses_fallback_reason_fields(self) -> None:
         item = {
             "source_path": "sequence/ctf/sequence.txt",

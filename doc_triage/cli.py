@@ -529,6 +529,13 @@ def rga_exclude_globs(pattern: str) -> list[str]:
     return [pattern]
 
 
+def is_ignorable_rga_failure(result: CommandResult) -> bool:
+    if result.exit_code != 2:
+        return False
+    stderr = result.stderr.lower()
+    return "preprocessor command failed" in stderr or "error: during preprocessing" in stderr
+
+
 def scan_target(
     target: Path,
     max_files: int | None,
@@ -605,7 +612,7 @@ def run_external_scanners(target: Path, exclude_globs: Sequence[str] | None = No
     rga_result = run_command(rga_command)
     if rga_result.timed_out:
         warnings.append("rga timed out.")
-    elif rga_result.exit_code in (0, 1):
+    elif rga_result.exit_code in (0, 1) or is_ignorable_rga_failure(rga_result):
         parsed_findings, parsed_warnings = parse_rga_output(rga_result.stdout, target)
         findings.extend(parsed_findings)
         warnings.extend(parsed_warnings)
