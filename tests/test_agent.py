@@ -368,6 +368,35 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(any(action.path == "HR/payroll.txt" for action in actions))
         self.assertTrue(any(action.query == "iban" for action in actions))
 
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    def test_plan_hypothesis_fanout_actions_deduplicates_shared_branch_actions(self, request_agent_plan: mock.Mock) -> None:
+        request_agent_plan.side_effect = [
+            ([], [cli.AgentAction(kind="read_head", path="Finance/payroll.txt", reason="inspect payroll branch", role="identity_reviewer", hypothesis_label="Payroll records")]),
+            ([], [cli.AgentAction(kind="read_head", path="Finance/payroll.txt", reason="inspect payroll branch again", role="identity_reviewer", hypothesis_label="Payroll records")]),
+            ([], [cli.AgentAction(kind="read_head", path="Finance/payroll.txt", reason="inspect iban branch", role="identity_reviewer", hypothesis_label="IBAN exposure")]),
+        ]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        hypotheses = [
+            cli.AgentHypothesis(label="Payroll records", rationale="employee data", role="identity_reviewer", evidence_paths=["Finance/payroll.txt"]),
+            cli.AgentHypothesis(label="IBAN exposure", rationale="bank identifiers", role="identity_reviewer", evidence_paths=["Finance/payroll.txt"]),
+        ]
+
+        _, actions, warnings = cli.plan_hypothesis_fanout_actions(
+            Path("/tmp/case"),
+            {"representative_heads": []},
+            [],
+            [],
+            hypotheses,
+            [],
+            args,
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "read_head")
+        self.assertEqual(actions[0].path, "Finance/payroll.txt")
+        self.assertEqual(actions[0].hypothesis_label, "Payroll records")
+
     def test_build_cross_role_handoff_plan_spawns_followup_role_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)

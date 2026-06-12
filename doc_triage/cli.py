@@ -2710,6 +2710,37 @@ def deduplicate_agent_actions(actions: list[AgentAction]) -> list[AgentAction]:
     return deduped
 
 
+def build_hypothesis_evidence_map(hypotheses: Sequence[AgentHypothesis]) -> dict[str, set[str]]:
+    evidence_map: dict[str, set[str]] = {}
+    for hypothesis in hypotheses:
+        label = hypothesis.label.strip()
+        if not label:
+            continue
+        paths = {path.strip() for path in hypothesis.evidence_paths if path.strip()}
+        if not paths:
+            continue
+        evidence_map.setdefault(label, set()).update(paths)
+    return evidence_map
+
+
+def is_branch_duplicate_action(
+    candidate: AgentAction,
+    existing: AgentAction,
+    hypothesis_evidence: dict[str, set[str]],
+) -> bool:
+    if candidate.kind != existing.kind:
+        return False
+    if candidate.path != existing.path or candidate.query != existing.query:
+        return False
+    candidate_label = candidate.hypothesis_label.strip()
+    existing_label = existing.hypothesis_label.strip()
+    if not candidate_label or not existing_label or candidate_label == existing_label:
+        return False
+    candidate_paths = hypothesis_evidence.get(candidate_label, set())
+    existing_paths = hypothesis_evidence.get(existing_label, set())
+    return bool(candidate_paths and existing_paths and candidate_paths.intersection(existing_paths))
+
+
 def build_fallback_agent_plan(
     target: Path,
     findings: list[Finding],
@@ -3867,6 +3898,7 @@ def plan_hypothesis_fanout_actions(
 
     seeded_actions = deduplicate_agent_actions(existing_actions)
     action_keys = {(action.kind, action.path, action.query, action.hypothesis_label, action.code) for action in seeded_actions}
+    tracked_hypotheses = [*hypotheses]
     grouped_hypotheses = list(group_hypotheses_by_role(hypotheses).items())[: min(4, len(group_hypotheses_by_role(hypotheses)))]
     for index, (role, role_hypotheses) in enumerate(grouped_hypotheses, start=1):
         remaining_budget = max(0, args.agent_max_actions - len(seeded_actions) - len(additional_actions))
@@ -3906,10 +3938,17 @@ def plan_hypothesis_fanout_actions(
                 for existing in hypotheses + additional_hypotheses
             ):
                 additional_hypotheses.append(focused_hypothesis)
+                tracked_hypotheses.append(focused_hypothesis)
+        evidence_map = build_hypothesis_evidence_map([*tracked_hypotheses, *additional_hypotheses])
         for action in deduplicate_agent_actions(focused_actions):
             action.role = action.role or role
             key = (action.kind, action.path, action.query, action.hypothesis_label, action.code)
             if key in action_keys:
+                continue
+            if any(
+                is_branch_duplicate_action(action, existing_action, evidence_map)
+                for existing_action in [*seeded_actions, *additional_actions]
+            ):
                 continue
             action_keys.add(key)
             additional_actions.append(action)
@@ -3953,10 +3992,17 @@ def plan_hypothesis_fanout_actions(
                     for existing in hypotheses + additional_hypotheses
                 ):
                     additional_hypotheses.append(focused_hypothesis)
+                    tracked_hypotheses.append(focused_hypothesis)
+            evidence_map = build_hypothesis_evidence_map([*tracked_hypotheses, *additional_hypotheses])
             for action in deduplicate_agent_actions(focused_actions):
                 action.role = action.role or role
                 key = (action.kind, action.path, action.query, action.hypothesis_label, action.code)
                 if key in action_keys:
+                    continue
+                if any(
+                    is_branch_duplicate_action(action, existing_action, evidence_map)
+                    for existing_action in [*seeded_actions, *additional_actions]
+                ):
                     continue
                 action_keys.add(key)
                 additional_actions.append(action)
@@ -3985,6 +4031,7 @@ def plan_inconclusive_hypothesis_checks(
     seeded_actions = deduplicate_agent_actions(list(existing_actions))
     action_keys = {(action.kind, action.path, action.query, action.hypothesis_label, action.code) for action in seeded_actions}
     hypotheses_seen = {(item.role, item.label, item.rationale) for item in hypotheses}
+    tracked_hypotheses = list(hypotheses)
 
     for index, hypothesis in enumerate(ranked_hypotheses[:3], start=1):
         remaining_budget = max(0, args.agent_max_actions - len(existing_actions) - len(additional_actions))
@@ -4024,11 +4071,18 @@ def plan_inconclusive_hypothesis_checks(
                 continue
             hypotheses_seen.add(key)
             additional_hypotheses.append(focused_hypothesis)
+            tracked_hypotheses.append(focused_hypothesis)
+        evidence_map = build_hypothesis_evidence_map([*tracked_hypotheses, *additional_hypotheses])
         for action in deduplicate_agent_actions(focused_actions):
             action.role = action.role or role
             action.hypothesis_label = action.hypothesis_label or hypothesis.label
             key = (action.kind, action.path, action.query, action.hypothesis_label, action.code)
             if key in action_keys:
+                continue
+            if any(
+                is_branch_duplicate_action(action, existing_action, evidence_map)
+                for existing_action in [*seeded_actions, *additional_actions]
+            ):
                 continue
             action_keys.add(key)
             additional_actions.append(action)
