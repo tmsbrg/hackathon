@@ -374,6 +374,59 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(any(a.role == "credential_hunter" for a in actions))
         self.assertTrue(any("document_analyst -> credential_hunter" in note for note in notes))
 
+    def test_coordinate_hypotheses_deterministically_confirms_supported_hypothesis(self) -> None:
+        hypotheses = [
+            cli.AgentHypothesis(
+                label="VPN token reuse",
+                rationale="Helpdesk email mentions login tokens",
+                role="credential_hunter",
+                evidence_paths=["docs/a.txt"],
+            )
+        ]
+        observations = [
+            cli.AgentObservation(
+                path="docs/a.txt",
+                evidence="temporary login token noted for VPN access",
+                source_mechanism="read_head",
+                confidence=0.95,
+                role="credential_hunter",
+                derived_claim="Found likely login material",
+            )
+        ]
+
+        updated = cli.coordinate_hypotheses_deterministically(hypotheses, observations)
+
+        self.assertEqual(updated[0].status, "confirmed")
+        self.assertIn("docs/a.txt", updated[0].evidence_paths)
+
+    @mock.patch("doc_triage.cli.request_agent_coordination")
+    def test_run_agent_mode_applies_coordinator_updates(self, request_agent_coordination: mock.Mock) -> None:
+        request_agent_coordination.return_value = [
+            cli.AgentHypothesis(
+                label="VPN token reuse",
+                rationale="Coordinator confirmed the token reuse hypothesis",
+                status="confirmed",
+                role="credential_hunter",
+                evidence_paths=["docs/a.txt"],
+                notes="Confirmed by coordinator",
+            )
+        ]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / "docs").mkdir()
+            (target / "docs" / "a.txt").write_text("temporary login token noted for VPN access\n", encoding="utf-8")
+            hypotheses = [cli.AgentHypothesis(label="VPN token reuse", rationale="Helpdesk email mentions login tokens", role="credential_hunter")]
+            observations = [cli.AgentObservation(path="docs/a.txt", evidence="temporary login token noted for VPN access", source_mechanism="read_head", confidence=0.95, role="credential_hunter", derived_claim="Found likely login material")]
+
+            merged = cli.merge_hypothesis_updates(
+                cli.coordinate_hypotheses_deterministically(hypotheses, observations),
+                request_agent_coordination.return_value,
+            )
+
+        self.assertEqual(merged[0].status, "confirmed")
+        self.assertIn("Confirmed by coordinator", merged[0].notes)
+
     def test_parse_agent_actions_normalizes_zip_list_directory_target(self) -> None:
         actions = cli.parse_agent_actions(
             [{"kind": "zip_list", "path": "ctf_cases/bad_blockchain", "reason": "inspect archive-like target"}]
@@ -1491,12 +1544,14 @@ class AgentModeTests(unittest.TestCase):
 
     @mock.patch("doc_triage.cli.request_agent_summary", return_value={"executive_summary": "done", "priority_findings": [], "relationships": [], "review_order": []})
     @mock.patch("doc_triage.cli.request_agent_plan")
+    @mock.patch("doc_triage.cli.request_agent_coordination", return_value=[])
     @mock.patch("doc_triage.cli.execute_agent_actions")
     def test_run_agent_mode_verbose_prints_stage_progress(
         self,
         execute_agent_actions: mock.Mock,
-        request_agent_plan: mock.Mock,
         _: mock.Mock,
+        request_agent_plan: mock.Mock,
+        __: mock.Mock,
     ) -> None:
         request_agent_plan.side_effect = [
             (
@@ -1522,16 +1577,19 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("[doc-triage] [agent] Planning initial actions", rendered)
         self.assertIn("[doc-triage] [agent] Executing initial actions", rendered)
         self.assertIn("[doc-triage] [agent] Executing subagent document_analyst actions", rendered)
+        self.assertIn("[doc-triage] [agent] Requesting coordinator hypothesis review", rendered)
         self.assertIn("[doc-triage] [agent] Requesting final agent summary", rendered)
 
     @mock.patch("doc_triage.cli.request_agent_summary", return_value={"executive_summary": "done", "priority_findings": [], "relationships": [], "review_order": []})
     @mock.patch("doc_triage.cli.request_agent_plan")
+    @mock.patch("doc_triage.cli.request_agent_coordination", return_value=[])
     @mock.patch("doc_triage.cli.execute_agent_actions")
     def test_run_agent_mode_uses_cross_role_handoff_actions(
         self,
         execute_agent_actions: mock.Mock,
-        request_agent_plan: mock.Mock,
         _: mock.Mock,
+        request_agent_plan: mock.Mock,
+        __: mock.Mock,
     ) -> None:
         request_agent_plan.side_effect = [
             (
