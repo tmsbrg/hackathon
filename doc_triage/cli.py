@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,8 @@ EXIT_USAGE = 2
 REQUIRED_TOOLS = ("rg", "rga", "trufflehog")
 OPTIONAL_OCR_TOOLS = ("tesseract", "ocrmypdf", "pdftotext")
 TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".conf", ".log", ".ini", ".json", ".yaml", ".yml", ".csv"}
+OCR_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+OCR_PDF_EXTENSIONS = {".pdf"}
 SENSITIVE_FILENAMES = {
     ".env": ("credential", "high"),
     "id_rsa": ("sensitive-file", "critical"),
@@ -287,7 +290,7 @@ def extract_digit_runs(text: str) -> list[str]:
     return values
 
 
-def scan_target(target: Path, max_files: int | None) -> tuple[list[Finding], list[str]]:
+def scan_target(target: Path, max_files: int | None, ocr: bool = False) -> tuple[list[Finding], list[str]]:
     warnings: list[str] = []
     findings: list[Finding] = []
     file_count = 0
@@ -316,6 +319,12 @@ def scan_target(target: Path, max_files: int | None) -> tuple[list[Finding], lis
             warnings.append(f"Could not read {file_path}: {exc}")
             continue
         findings.extend(keyword_findings(target, file_path, content))
+
+    if ocr:
+        with tempfile.TemporaryDirectory(prefix="doc-triage-ocr-") as temp_dir:
+            ocr_findings, ocr_warnings = collect_ocr_findings(target, files, Path(temp_dir))
+        findings.extend(ocr_findings)
+        warnings.extend(ocr_warnings)
 
     return deduplicate_findings(findings), warnings
 
@@ -350,6 +359,46 @@ def run_external_scanners(target: Path) -> tuple[list[Finding], list[str]]:
     else:
         warnings.append("trufflehog failed.")
 
+    return findings, warnings
+
+
+def collect_ocr_findings(target: Path, files: list[Path], work_dir: Path) -> tuple[list[Finding], list[str]]:
+    findings: list[Finding] = []
+    warnings: list[str] = []
+    work_dir.mkdir(parents=True, exist_ok=True)
+    for file_path in files:
+        suffix = file_path.suffix.lower()
+        if suffix in OCR_IMAGE_EXTENSIONS:
+            stem = work_dir / file_path.stem
+            result = run_command(["tesseract", str(file_path), str(stem)])
+            if result.exit_code != 0:
+                warnings.append(f"OCR failed for {file_path.name}.")
+                continue
+            text_path = stem.with_suffix(".txt")
+            if not text_path.exists():
+                warnings.append(f"OCR output missing for {file_path.name}.")
+                continue
+            content = text_path.read_text(encoding="utf-8", errors="ignore")
+            image_findings = keyword_findings(target, file_path, content)
+            for finding in image_findings:
+                finding.metadata["ocr_source"] = file_path.name
+            findings.extend(image_findings)
+        elif suffix in OCR_PDF_EXTENSIONS:
+            output_pdf = work_dir / file_path.name
+            ocr_result = run_command(["ocrmypdf", str(file_path), str(output_pdf)])
+            if ocr_result.exit_code != 0:
+                warnings.append(f"PDF OCR failed for {file_path.name}.")
+                continue
+            text_path = work_dir / f"{file_path.stem}.txt"
+            text_result = run_command(["pdftotext", str(output_pdf), str(text_path)])
+            if text_result.exit_code != 0 or not text_path.exists():
+                warnings.append(f"PDF text extraction failed for {file_path.name}.")
+                continue
+            content = text_path.read_text(encoding="utf-8", errors="ignore")
+            pdf_findings = keyword_findings(target, file_path, content)
+            for finding in pdf_findings:
+                finding.metadata["ocr_source"] = file_path.name
+            findings.extend(pdf_findings)
     return findings, warnings
 
 
@@ -562,7 +611,7 @@ def run_scan(args: argparse.Namespace) -> int:
     if not target.exists() or not target.is_dir():
         return EXIT_ERROR
 
-    findings, warnings = scan_target(target, args.max_files)
+    findings, warnings = scan_target(target, args.max_files, ocr=args.ocr)
     llm_summary: dict[str, object] | None = None
     if not args.no_llm and findings:
         try:
