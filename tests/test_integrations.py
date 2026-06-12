@@ -95,6 +95,75 @@ class IntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(len(findings), 2)
         self.assertEqual(run_command.call_count, 3)
 
+    @mock.patch("doc_triage.cli.run_command")
+    def test_run_external_scanners_passes_trufflehog_excludes_via_temp_file(self, run_command: mock.Mock) -> None:
+        captured_path: Path | None = None
+
+        def side_effect(command: list[str], **_: object) -> cli.CommandResult:
+            nonlocal captured_path
+            if command[0] == "rg":
+                return cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
+            if command[0] == "rga":
+                return cli.CommandResult(exit_code=1, stdout="", stderr="", timed_out=False)
+            if command[0] == "trufflehog":
+                self.assertEqual(command.count("--exclude-paths"), 1)
+                captured_path = Path(command[command.index("--exclude-paths") + 1])
+                self.assertTrue(captured_path.exists())
+                self.assertEqual(
+                    captured_path.read_text(encoding="utf-8"),
+                    "(?s:.*/ANSWER\\.txt)\n(?s:.*/HINT\\.txt)\n",
+                )
+                return cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
+            raise AssertionError(f"Unexpected command: {command}")
+
+        run_command.side_effect = side_effect
+
+        findings, warnings = cli.run_external_scanners(
+            Path("/tmp/case"),
+            exclude_globs=["*/ANSWER.txt", "*/HINT.txt"],
+        )
+
+        self.assertEqual(findings, [])
+        self.assertEqual(warnings, [])
+        self.assertIsNotNone(captured_path)
+        self.assertFalse(captured_path.exists())
+
+    @mock.patch("doc_triage.cli.run_command")
+    def test_run_external_scanners_expands_rga_globs_for_recursive_excludes(self, run_command: mock.Mock) -> None:
+        seen_rga_command: list[str] | None = None
+
+        def side_effect(command: list[str], **_: object) -> cli.CommandResult:
+            nonlocal seen_rga_command
+            if command[0] == "rg":
+                return cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
+            if command[0] == "rga":
+                seen_rga_command = command
+                return cli.CommandResult(exit_code=1, stdout="", stderr="", timed_out=False)
+            if command[0] == "trufflehog":
+                return cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
+            raise AssertionError(f"Unexpected command: {command}")
+
+        run_command.side_effect = side_effect
+
+        cli.run_external_scanners(Path("/tmp/case"), exclude_globs=["*/ANSWER.txt", "README.txt"])
+
+        self.assertIsNotNone(seen_rga_command)
+        self.assertIn("!**/ANSWER.txt", seen_rga_command)
+        self.assertIn("!ANSWER.txt", seen_rga_command)
+        self.assertIn("!README.txt", seen_rga_command)
+
+    def test_render_priority_item_uses_fallback_reason_fields(self) -> None:
+        item = {
+            "source_path": "sequence/ctf/sequence.txt",
+            "supporting_evidence": "__cfduid=...",
+            "context": "Legacy Cloudflare cookie",
+        }
+
+        rendered = cli.render_priority_item(item)
+
+        self.assertIn("sequence/ctf/sequence.txt", rendered)
+        self.assertIn("Legacy Cloudflare cookie", rendered)
+
     @mock.patch("doc_triage.cli.urlopen")
     def test_ollama_summary_parses_json_response(self, urlopen: mock.Mock) -> None:
         response = mock.Mock()

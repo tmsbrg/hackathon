@@ -387,6 +387,18 @@ def should_exclude(target: Path, file_path: Path, exclude_globs: Sequence[str]) 
     return any(fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(file_path.name, pattern) for pattern in exclude_globs)
 
 
+def glob_to_regex(pattern: str) -> str:
+    translated = fnmatch.translate(pattern)
+    return translated.removesuffix(r"\Z").removesuffix(r"\z")
+
+
+def rga_exclude_globs(pattern: str) -> list[str]:
+    if pattern.startswith("*/"):
+        suffix = pattern[2:]
+        return [f"**/{suffix}", suffix]
+    return [pattern]
+
+
 def scan_target(
     target: Path,
     max_files: int | None,
@@ -457,7 +469,8 @@ def run_external_scanners(target: Path, exclude_globs: Sequence[str] | None = No
 
     rga_command = ["rga", "--json"]
     for pattern in exclude_globs:
-        rga_command.extend(["-g", f"!{pattern}"])
+        for expanded in rga_exclude_globs(pattern):
+            rga_command.extend(["-g", f"!{expanded}"])
     rga_command.extend([".", str(target)])
     rga_result = run_command(rga_command)
     if rga_result.timed_out:
@@ -470,9 +483,19 @@ def run_external_scanners(target: Path, exclude_globs: Sequence[str] | None = No
         warnings.append("rga failed.")
 
     trufflehog_command = ["trufflehog", "filesystem", "--json", "--no-update", str(target)]
-    for pattern in exclude_globs:
-        trufflehog_command.extend(["--exclude-paths", pattern])
+    exclude_file: tempfile.NamedTemporaryFile[str] | None = None
+    if exclude_globs:
+        exclude_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="doc-triage-trufflehog-", suffix=".txt", delete=False)
+        try:
+            exclude_file.write("\n".join(glob_to_regex(pattern) for pattern in exclude_globs))
+            exclude_file.write("\n")
+            exclude_file.flush()
+        finally:
+            exclude_file.close()
+        trufflehog_command.extend(["--exclude-paths", exclude_file.name])
     trufflehog_result = run_command(trufflehog_command)
+    if exclude_file is not None:
+        Path(exclude_file.name).unlink(missing_ok=True)
     if trufflehog_result.timed_out:
         warnings.append("trufflehog timed out.")
     elif trufflehog_result.exit_code in (0, 183):
@@ -808,7 +831,15 @@ def looks_like_source_path(value: object) -> bool:
 def render_priority_item(item: object) -> str:
     if isinstance(item, dict):
         source = item.get("source") or item.get("source_path") or "<source missing>"
-        reason = item.get("why") or item.get("description") or item.get("claim") or item.get("rationale") or ""
+        reason = (
+            item.get("why")
+            or item.get("description")
+            or item.get("claim")
+            or item.get("rationale")
+            or item.get("context")
+            or item.get("supporting_evidence")
+            or "<reason missing>"
+        )
         return f"- {source}: {reason}".rstrip()
     return f"- {item}"
 
