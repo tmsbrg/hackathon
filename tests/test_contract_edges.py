@@ -147,6 +147,20 @@ class ContractEdgeTests(unittest.TestCase):
         self.assertIn("healthy", stdout.getvalue())
         self.assertIn("rg-1.0", stdout.getvalue())
 
+    @mock.patch("doc_triage.cli.shutil.which", side_effect=lambda name: None if name == "ollama" else f"/usr/bin/{name}")
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_detect_tools_marks_ollama_api_only_when_service_is_reachable(self, urlopen: mock.Mock, _: mock.Mock) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        response.read.return_value = json.dumps({"models": [{"name": "glm"}]}).encode("utf-8")
+        urlopen.return_value = response
+
+        statuses = cli.detect_tools()
+
+        ollama = next(item for item in statuses if item.name == "ollama")
+        self.assertEqual(ollama.path, "<api-only>")
+
     def test_cleanup_tempdirs_removes_registered_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_path = Path(tmpdir, "ocr-work")
@@ -188,6 +202,61 @@ class ContractEdgeTests(unittest.TestCase):
         self.assertIn("\033[", rendered)
         self.assertIn("Top findings:", rendered)
         self.assertIn("Evidence: password=secret", rendered)
+
+    @mock.patch("doc_triage.cli.run_agent_mode")
+    @mock.patch("doc_triage.cli.scan_target")
+    @mock.patch(
+        "doc_triage.cli.detect_tools",
+        return_value=[
+            cli.ToolStatus("rg", "/usr/bin/rg", True),
+            cli.ToolStatus("rga", "/usr/bin/rga", True),
+            cli.ToolStatus("trufflehog", "/usr/bin/trufflehog", True),
+            cli.ToolStatus("tesseract", "/usr/bin/tesseract", False),
+            cli.ToolStatus("ocrmypdf", "/usr/bin/ocrmypdf", False),
+            cli.ToolStatus("pdftotext", "/usr/bin/pdftotext", False),
+            cli.ToolStatus("ollama", "<api-only>", False),
+        ],
+    )
+    def test_scan_treats_agent_summary_warning_as_non_fatal(
+        self,
+        _: mock.Mock,
+        scan_target: mock.Mock,
+        run_agent_mode: mock.Mock,
+    ) -> None:
+        scan_target.return_value = (
+            [
+                cli.Finding(
+                    source="a.txt",
+                    category="credential",
+                    severity="high",
+                    detector="built-in",
+                    evidence="password=secret",
+                    line=1,
+                    confidence=0.9,
+                    metadata={},
+                )
+            ],
+            [],
+        )
+        run_agent_mode.return_value = cli.AgentRun(
+            warnings=["agent summary failed: Ollama response did not include the required JSON keys."],
+            observations=[
+                cli.AgentObservation(
+                    path="a.txt",
+                    evidence="password=secret",
+                    source_mechanism="read_head",
+                    confidence=0.9,
+                )
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, "case")
+            target.mkdir()
+            output = target / "report.md"
+            exit_code = cli.main(["scan", str(target), "--output", str(output), "--agent"])
+
+        self.assertEqual(exit_code, 0)
 
 
 if __name__ == "__main__":

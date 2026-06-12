@@ -176,6 +176,21 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(observations[0].path, "alpha.txt")
         self.assertEqual(observations[0].source_mechanism, "content_search")
 
+    def test_execute_agent_actions_treats_read_head_directory_as_dir_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / "docs").mkdir()
+            (target / "docs" / "a.txt").write_text("x\n", encoding="utf-8")
+            observations, warnings = cli.execute_agent_actions(
+                target,
+                [cli.AgentAction(kind="read_head", path="docs", reason="inspect dir", limit=5)],
+                per_action_timeout=5,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source_mechanism, "dir_list")
+
     def test_validate_generated_helper_source_rejects_unsafe_constructs(self) -> None:
         errors = cli.validate_generated_helper_source("import subprocess\nprint('nope')\n")
 
@@ -274,6 +289,39 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(hypotheses), 1)
         self.assertEqual(len(actions), 1)
 
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_summary_repairs_non_json_response_once(self, urlopen: mock.Mock) -> None:
+        first = mock.Mock()
+        first.__enter__ = mock.Mock(return_value=first)
+        first.__exit__ = mock.Mock(return_value=False)
+        first.read.return_value = json.dumps({"response": "{broken"}).encode("utf-8")
+
+        second = mock.Mock()
+        second.__enter__ = mock.Mock(return_value=second)
+        second.__exit__ = mock.Mock(return_value=False)
+        second.read.return_value = json.dumps(
+            {
+                "response": json.dumps(
+                    {
+                        "executive_summary": "fixed",
+                        "priority_findings": [],
+                        "relationships": [],
+                        "review_order": [],
+                    }
+                )
+            }
+        ).encode("utf-8")
+        urlopen.side_effect = [first, second]
+
+        summary = cli.request_agent_summary(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            {"instructions": ["Return executive_summary, priority_findings, relationships, review_order"]},
+        )
+
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(summary["executive_summary"], "fixed")
+
     @mock.patch("doc_triage.cli.run_command")
     @mock.patch("doc_triage.cli.shutil.which", return_value="/usr/bin/bwrap")
     def test_execute_generated_helper_parses_observations(self, _: mock.Mock, run_command: mock.Mock) -> None:
@@ -368,6 +416,35 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertEqual(len(run.actions), 2)
         self.assertEqual(run.actions[1].kind, "dir_list")
+
+    @mock.patch("doc_triage.cli.request_agent_plan", side_effect=RuntimeError("bad json"))
+    @mock.patch("doc_triage.cli.execute_agent_actions")
+    def test_run_agent_mode_falls_back_when_initial_planning_fails(
+        self,
+        execute_agent_actions: mock.Mock,
+        _: mock.Mock,
+    ) -> None:
+        execute_agent_actions.side_effect = [([], []), ([], [])]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / "a.txt").write_text("password=secret\n", encoding="utf-8")
+            findings = [
+                cli.Finding(
+                    source="a.txt",
+                    category="credential",
+                    severity="high",
+                    detector="built-in",
+                    evidence="password=secret",
+                    line=1,
+                    confidence=0.9,
+                    metadata={},
+                )
+            ]
+            run = cli.run_agent_mode(target, findings, args)
+
+        self.assertTrue(run.actions)
+        self.assertTrue(any("agent planning failed:" in warning for warning in run.warnings))
 
 
 if __name__ == "__main__":
