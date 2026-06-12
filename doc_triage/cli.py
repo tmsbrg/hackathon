@@ -1030,11 +1030,11 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--no-llm", action="store_true")
     scan.add_argument(
         "--multi-agent",
-        "--agent",
         dest="agent",
         action="store_true",
         help="Enable the multi-agent subagent planning and investigation flow.",
     )
+    scan.add_argument("--agent", dest="legacy_agent", action="store_true", help=argparse.SUPPRESS)
     scan.add_argument("--agent-max-actions", type=int, default=8)
     scan.add_argument("--agent-timeout", type=int, default=30)
     scan.add_argument("--model-retries", type=int, default=1)
@@ -5094,8 +5094,11 @@ def summarize_hypothesis_branches_for_llm(
 
 
 def run_scan(args: argparse.Namespace) -> int:
+    if getattr(args, "legacy_agent", False):
+        print("error: --agent has been replaced by --multi-agent", file=sys.stderr)
+        return EXIT_USAGE
     if args.agent and args.no_llm:
-        print("error: --agent requires LLM mode and cannot be used with --no-llm", file=sys.stderr)
+        print("error: --multi-agent requires LLM mode and cannot be used with --no-llm", file=sys.stderr)
         return EXIT_USAGE
     if args.model_retries < 0:
         print("error: --model-retries must be >= 0", file=sys.stderr)

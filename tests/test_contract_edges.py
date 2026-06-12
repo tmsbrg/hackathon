@@ -289,7 +289,7 @@ class ContractEdgeTests(unittest.TestCase):
             target = Path(tmpdir, "case")
             target.mkdir()
             output = target / "report.md"
-            exit_code = cli.main(["scan", str(target), "--output", str(output), "--agent"])
+            exit_code = cli.main(["scan", str(target), "--output", str(output), "--multi-agent"])
 
         self.assertEqual(exit_code, 0)
 

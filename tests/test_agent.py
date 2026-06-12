@@ -14,7 +14,7 @@ from doc_triage import cli
 class AgentModeTests(unittest.TestCase):
     def test_scan_rejects_agent_with_no_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            exit_code = cli.main(["scan", tmpdir, "--agent", "--no-llm"])
+            exit_code = cli.main(["scan", tmpdir, "--multi-agent", "--no-llm"])
 
         self.assertEqual(exit_code, cli.EXIT_USAGE)
 
@@ -45,7 +45,7 @@ class AgentModeTests(unittest.TestCase):
             (target / "plain.txt").write_text("hello\n", encoding="utf-8")
             output = Path(tmpdir, "report.md")
 
-            exit_code = cli.main(["scan", str(target), "--output", str(output), "--agent"])
+            exit_code = cli.main(["scan", str(target), "--output", str(output), "--multi-agent"])
 
         self.assertEqual(exit_code, cli.EXIT_OK)
         run_agent_mode.assert_called_once()
@@ -282,7 +282,7 @@ class AgentModeTests(unittest.TestCase):
                 ],
             ),
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         hypotheses = [cli.AgentHypothesis(label="archive lead", rationale="Check archives", role="archive_analyst")]
         existing = [cli.AgentAction(kind="dir_list", path="Archives", reason="Survey archives")]
 
@@ -311,7 +311,7 @@ class AgentModeTests(unittest.TestCase):
             ([], [cli.AgentAction(kind="dir_list", path="HR", reason="inspect HR docs", role="identity_reviewer")]),
             ([], [cli.AgentAction(kind="read_head", path="Finance/payroll.xlsx", reason="inspect payroll clue", role="identity_reviewer")]),
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         hypotheses = [
             cli.AgentHypothesis(label="VPN token reuse", rationale="Helpdesk mail mentions login tokens", role="credential_hunter"),
             cli.AgentHypothesis(label="Payroll records", rationale="HR material may hold identifiers", role="identity_reviewer"),
@@ -347,7 +347,7 @@ class AgentModeTests(unittest.TestCase):
                 [cli.AgentAction(kind="content_search", query="iban", reason="test iban hypothesis", role="identity_reviewer")],
             ),
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         hypotheses = [
             cli.AgentHypothesis(label="Payroll records", rationale="HR material may hold identifiers", role="identity_reviewer"),
             cli.AgentHypothesis(label="IBAN exposure", rationale="Finance docs may expose account identifiers", role="identity_reviewer"),
@@ -375,7 +375,7 @@ class AgentModeTests(unittest.TestCase):
             ([], [cli.AgentAction(kind="read_head", path="Finance/payroll.txt", reason="inspect payroll branch again", role="identity_reviewer", hypothesis_label="Payroll records")]),
             ([], [cli.AgentAction(kind="read_head", path="Finance/payroll.txt", reason="inspect iban branch", role="identity_reviewer", hypothesis_label="IBAN exposure")]),
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         hypotheses = [
             cli.AgentHypothesis(label="Payroll records", rationale="employee data", role="identity_reviewer", evidence_paths=["Finance/payroll.txt"]),
             cli.AgentHypothesis(label="IBAN exposure", rationale="bank identifiers", role="identity_reviewer", evidence_paths=["Finance/payroll.txt"]),
@@ -478,7 +478,7 @@ class AgentModeTests(unittest.TestCase):
             [cli.AgentHypothesis(label="credential follow-up", rationale="handoff", role="credential_hunter")],
             [cli.AgentAction(kind="content_search", query="password", reason="replanned credential search", role="credential_hunter")],
         )
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)
             (target / "docs").mkdir()
@@ -679,7 +679,7 @@ class AgentModeTests(unittest.TestCase):
             [cli.AgentHypothesis(label="vpn lead", rationale="token clue", status="confirmed", role="credential_hunter")],
             [cli.AgentHypothesis(label="finance lead", rationale="payroll clue", status="inconclusive", role="identity_reviewer")],
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         hypotheses = [
             cli.AgentHypothesis(label="vpn lead", rationale="token clue", role="credential_hunter"),
             cli.AgentHypothesis(label="finance lead", rationale="payroll clue", role="identity_reviewer"),
@@ -726,7 +726,7 @@ class AgentModeTests(unittest.TestCase):
                 notes="Confirmed by coordinator",
             )
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)
             (target / "docs").mkdir()
@@ -1220,7 +1220,7 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("generated helpers skipped", " ".join(warnings))
 
     def test_render_report_includes_agent_sections(self) -> None:
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         agent_run = cli.AgentRun(
             hypotheses=[cli.AgentHypothesis(label="archive contains credentials", rationale="zip nearby", role="archive_analyst")],
             actions=[cli.AgentAction(kind="dir_list", path=".", reason="survey root", role="archive_analyst")],
@@ -1870,7 +1870,7 @@ class AgentModeTests(unittest.TestCase):
             ([cli.AgentObservation(path="a.txt", evidence="one", source_mechanism="read_head", confidence=0.8)], []),
             ([cli.AgentObservation(path="docs", evidence="b.txt", source_mechanism="dir_list", confidence=0.6)], []),
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         with tempfile.TemporaryDirectory() as tmpdir:
             run = cli.run_agent_mode(Path(tmpdir), [], args)
 
@@ -1887,7 +1887,7 @@ class AgentModeTests(unittest.TestCase):
         __: mock.Mock,
     ) -> None:
         execute_agent_actions.side_effect = [([], []), ([], [])]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)
             (target / "a.txt").write_text("password=secret\n", encoding="utf-8")
@@ -1933,7 +1933,7 @@ class AgentModeTests(unittest.TestCase):
             ([cli.AgentObservation(path="a.txt", evidence="one", source_mechanism="read_head", confidence=0.8)], []),
             ([], []),
         ]
-        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--multi-agent"])
         stdout = StringIO()
         with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stdout(stdout):
             cli.run_agent_mode(Path(tmpdir), [], args)
@@ -2005,7 +2005,7 @@ class AgentModeTests(unittest.TestCase):
                 [],
             ),
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)
             (target / "docs").mkdir()
@@ -2076,7 +2076,7 @@ class AgentModeTests(unittest.TestCase):
                 [],
             ),
         ]
-        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--multi-agent"])
         stdout = StringIO()
         with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stdout(stdout):
             target = Path(tmpdir)
@@ -2154,7 +2154,7 @@ class AgentModeTests(unittest.TestCase):
                 [],
             ),
         ]
-        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--multi-agent"])
         stdout = StringIO()
         with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stdout(stdout):
             target = Path(tmpdir)
@@ -2211,7 +2211,7 @@ class AgentModeTests(unittest.TestCase):
                 [],
             ),
         ]
-        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--agent"])
+        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--multi-agent"])
         stdout = StringIO()
         with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stdout(stdout):
             target = Path(tmpdir)
