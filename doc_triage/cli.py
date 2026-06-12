@@ -24,6 +24,7 @@ from .constants import (
     OCR_PDF_EXTENSIONS,
     REQUIRED_TOOLS,
     SEVERITY_ORDER,
+    SENSITIVE_FILENAMES,
     TEXT_EXTENSIONS,
 )
 from .detectors import (

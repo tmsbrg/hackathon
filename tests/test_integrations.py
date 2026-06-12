@@ -65,6 +65,18 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(findings, [])
 
+    def test_keyword_findings_detects_flag_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "note.txt"
+            path.write_text("Recovered marker: flag{language}\n", encoding="utf-8")
+
+            findings = cli.keyword_findings(target, path, path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].category, "challenge-flag")
+        self.assertIn("flag{language}", findings[0].evidence)
+
     def test_parse_trufflehog_output_tolerates_invalid_json(self) -> None:
         payload = '{"SourceMetadata":{"Data":{"Filesystem":{"file":"a.txt"}}},"DetectorName":"AWS","Raw":"AKIA..."}\nnope\n'
 

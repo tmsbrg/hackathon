@@ -26,6 +26,10 @@ KEYWORD_RULES = {
     "bsn": ("personal-data", "medium", 0.7),
 }
 SIGNAL_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, str, float]], ...] = (
+    (
+        re.compile(r"\b(?:flag|idek|bi0sCTF|EQCTF|icc)\{[^}\s]{3,120}\}", re.IGNORECASE),
+        ("challenge-flag", "high", 0.98),
+    ),
     (re.compile(r"\bpassword\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.95)),
     (re.compile(r"\b(passwd|pwd)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.95)),
     (re.compile(r"\b(secret|client_secret)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
