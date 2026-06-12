@@ -7,7 +7,7 @@ The report may contain verbatim secrets. Treat it like sensitive evidence.
 ## Current scope
 
 - Linux only
-- Python 3.12+
+- Python 3.10+
 - Local files or already-mounted shares
 - Local-only Ollama usage
 - No database, web UI, or persistent extraction cache
