@@ -4591,6 +4591,7 @@ def run_agent_mode(
             for finding in select_llm_findings(reviewed_findings, args.max_llm_files)
         ],
         "agent_observations": summarize_observations_for_llm(observations, max_items=min(12, args.max_llm_files * 2)),
+        "hypothesis_evidence": summarize_hypothesis_observations_for_llm(all_hypotheses, observations, max_items=min(8, args.max_llm_files)),
         "hypotheses": [asdict(hypothesis) for hypothesis in all_hypotheses[:8]],
     }
     llm_summary: dict[str, object] | None = None
@@ -4753,6 +4754,51 @@ def summarize_observations_for_llm(
             }
         )
     return summarized
+
+
+def summarize_hypothesis_observations_for_llm(
+    hypotheses: Sequence[AgentHypothesis],
+    observations: Sequence[AgentObservation],
+    max_items: int = 8,
+    evidence_limit: int = 180,
+) -> list[dict[str, object]]:
+    summaries: list[dict[str, object]] = []
+    for hypothesis in hypotheses:
+        linked = [
+            observation
+            for observation in observations
+            if observation.hypothesis_label == hypothesis.label
+        ]
+        if not linked:
+            continue
+        ranked = sorted(
+            linked,
+            key=lambda observation: (
+                -observation.confidence,
+                observation.path,
+                observation.source_mechanism,
+            ),
+        )
+        summaries.append(
+            {
+                "label": hypothesis.label,
+                "role": hypothesis.role,
+                "status": hypothesis.status,
+                "top_observations": [
+                    {
+                        "path": observation.path,
+                        "source_mechanism": observation.source_mechanism,
+                        "confidence": observation.confidence,
+                        "derived_claim": observation.derived_claim,
+                        "evidence": summarize_evidence(observation.evidence, limit=evidence_limit),
+                    }
+                    for observation in ranked[:3]
+                ],
+            }
+        )
+        if len(summaries) >= max_items:
+            break
+    return summaries
 
 
 def run_scan(args: argparse.Namespace) -> int:

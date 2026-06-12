@@ -1071,6 +1071,7 @@ class AgentModeTests(unittest.TestCase):
                     source_mechanism="read_head",
                     confidence=0.9,
                     role="credential_hunter",
+                    hypothesis_label="archive contains credentials",
                     derived_claim="Contains a password",
                 )
             ],
@@ -1082,10 +1083,12 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertIn("## Agent Investigation Plan", report)
         self.assertIn("## Agent Observations", report)
+        self.assertIn("## Hypothesis Evidence", report)
         self.assertIn("## Agent Coverage and Limitations", report)
         self.assertIn("Exit status:", report)
         self.assertIn("role=credential_hunter", report)
         self.assertIn("subagent=archive analyst", report)
+        self.assertIn("archive contains credentials (archive_analyst, status=inconclusive)", report)
 
     def test_summarize_findings_includes_agent_stats(self) -> None:
         agent_run = cli.AgentRun(
@@ -1109,6 +1112,38 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("Agent mode", rendered)
         self.assertIn("password=secret", rendered)
         self.assertIn("role=credential_hunter", rendered)
+
+    def test_summarize_hypothesis_observations_for_llm_groups_linked_observations(self) -> None:
+        hypotheses = [
+            cli.AgentHypothesis(label="VPN token reuse", rationale="Helpdesk email mentions login tokens", role="credential_hunter", status="confirmed"),
+            cli.AgentHypothesis(label="Payroll records", rationale="HR material may hold identifiers", role="identity_reviewer"),
+        ]
+        observations = [
+            cli.AgentObservation(
+                path="vpn.txt",
+                evidence="vpn token reset instructions",
+                source_mechanism="content_search",
+                confidence=0.9,
+                role="credential_hunter",
+                hypothesis_label="VPN token reuse",
+                derived_claim="Confirmed VPN token material",
+            ),
+            cli.AgentObservation(
+                path="HR/payroll.txt",
+                evidence="employee salaries",
+                source_mechanism="read_head",
+                confidence=0.8,
+                role="identity_reviewer",
+                hypothesis_label="Payroll records",
+                derived_claim="Found payroll data",
+            ),
+        ]
+
+        summarized = cli.summarize_hypothesis_observations_for_llm(hypotheses, observations, max_items=4, evidence_limit=40)
+
+        self.assertEqual(len(summarized), 2)
+        self.assertEqual(summarized[0]["label"], "VPN token reuse")
+        self.assertEqual(summarized[0]["top_observations"][0]["path"], "vpn.txt")
 
     @mock.patch("doc_triage.cli.urlopen")
     def test_request_agent_plan_repairs_non_json_response_once(self, urlopen: mock.Mock) -> None:

@@ -49,6 +49,15 @@ def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def group_observations_by_hypothesis(observations: list[AgentObservation]) -> dict[str, list[AgentObservation]]:
+    grouped: dict[str, list[AgentObservation]] = {}
+    for observation in observations:
+        if not observation.hypothesis_label:
+            continue
+        grouped.setdefault(observation.hypothesis_label, []).append(observation)
+    return grouped
+
+
 def looks_like_secret_blob(text: str) -> bool:
     stripped = text.strip()
     if not RAW_SECRET_BLOB_PATTERN.fullmatch(stripped):
@@ -347,6 +356,7 @@ def render_report(
         lines.append("- None.")
 
     if agent_run is not None:
+        grouped_observations = group_observations_by_hypothesis(agent_run.observations)
         lines.extend(["", "## Agent Investigation Plan"])
         if agent_run.hypotheses:
             for hypothesis in agent_run.hypotheses:
@@ -382,6 +392,25 @@ def render_report(
                 lines.append(f"  Evidence: `{observation.evidence}`")
         else:
             lines.append("- No agent observations recorded.")
+
+        lines.extend(["", "## Hypothesis Evidence"])
+        hypothesis_lines = 0
+        for hypothesis in agent_run.hypotheses:
+            linked = grouped_observations.get(hypothesis.label, [])
+            if not linked:
+                continue
+            lines.append(f"- {hypothesis.label} ({hypothesis.role or 'unassigned'}, status={hypothesis.status})")
+            for observation in sorted(linked, key=lambda item: (-item.confidence, item.path, item.source_mechanism))[:3]:
+                lines.append(
+                    f"  - {observation.path} via {observation.source_mechanism} "
+                    f"(confidence={observation.confidence:.2f})"
+                )
+                if observation.derived_claim:
+                    lines.append(f"    Claim: {observation.derived_claim}")
+                lines.append(f"    Evidence: `{observation.evidence}`")
+            hypothesis_lines += 1
+        if hypothesis_lines == 0:
+            lines.append("- No hypothesis-linked observations recorded.")
 
         rejected = [item for item in agent_run.hypotheses if item.status == "rejected"]
         lines.extend(["", "## Rejected Hypotheses"])
