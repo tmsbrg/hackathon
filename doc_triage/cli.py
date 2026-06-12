@@ -71,6 +71,7 @@ from .reporting import (
     is_fatal_warning,
     looks_like_source_path,
     normalize_llm_summary,
+    render_terminal_report,
     render_findings,
     render_priority_item,
     render_relationship,
@@ -3710,6 +3711,8 @@ def run_scan(args: argparse.Namespace) -> int:
     write_report(output_path, report)
     progress_log(args.verbose, "report", "Report written successfully")
     print("\n".join(summarize_findings(findings, warnings, agent_run=agent_run)))
+    print()
+    print(render_terminal_report(report))
 
     statuses = detect_tools()
     missing_required = [tool.name for tool in statuses if tool.required and not tool.path]

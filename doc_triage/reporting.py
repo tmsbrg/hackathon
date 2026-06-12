@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,46 @@ def summarize_evidence(text: str, limit: int = 120) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
+
+
+def highlight_inline_code(text: str) -> str:
+    return re.sub(r"`([^`]+)`", lambda match: colorize(match.group(1), "critical"), text)
+
+
+def render_terminal_report(report: str) -> str:
+    rendered_lines: list[str] = []
+    for raw_line in report.splitlines():
+        line = raw_line
+        if line.startswith("# "):
+            rendered_lines.append(colorize(line[2:], "info"))
+            continue
+        if line.startswith("## "):
+            rendered_lines.append(colorize(line[3:], "info"))
+            continue
+        if line.startswith("### "):
+            rendered_lines.append(colorize(line[4:], "info"))
+            continue
+        if "Evidence:" in line:
+            prefix, suffix = line.split("Evidence:", 1)
+            rendered_lines.append(f"{prefix}{colorize('Evidence:', 'warning')} {highlight_inline_code(suffix.strip())}")
+            continue
+        if line.lstrip().startswith("- [critical]"):
+            rendered_lines.append(line.replace("[critical]", f"[{colorize('critical', 'critical')}]"))
+            continue
+        if line.lstrip().startswith("- [high]"):
+            rendered_lines.append(line.replace("[high]", f"[{colorize('high', 'high')}]"))
+            continue
+        if line.lstrip().startswith("- [medium]"):
+            rendered_lines.append(line.replace("[medium]", f"[{colorize('medium', 'medium')}]"))
+            continue
+        if line.lstrip().startswith("- [low]"):
+            rendered_lines.append(line.replace("[low]", f"[{colorize('low', 'low')}]"))
+            continue
+        if line.startswith("- ") or line.startswith("  - "):
+            rendered_lines.append(highlight_inline_code(line))
+            continue
+        rendered_lines.append(highlight_inline_code(line))
+    return "\n".join(rendered_lines)
 
 
 def summarize_findings(

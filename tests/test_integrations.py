@@ -630,6 +630,26 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("- a.txt", report)
         self.assertNotIn("1. Investigate timestamp first", report)
 
+    def test_render_terminal_report_highlights_evidence_and_preserves_full_text(self) -> None:
+        report = "\n".join(
+            [
+                "# Sensitive Report",
+                "",
+                "## Ranked High-Value Findings",
+                "- [high] credential in Finance/notes.txt:4 via rga",
+                "  Evidence: `password=secret`",
+                "",
+                "## Files Recommended for Manual Review",
+                "- Finance/notes.txt",
+            ]
+        )
+
+        rendered = cli.render_terminal_report(report)
+
+        self.assertIn("Sensitive Report", rendered)
+        self.assertIn("password=secret", rendered)
+        self.assertIn("\u001b[", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
