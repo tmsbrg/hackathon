@@ -32,6 +32,7 @@ ASSIGNMENT_VALUE_PATTERNS = (
         r"(?i)\b(?:password|passwd|pwd|wachtwoord|tijdelijk_wachtwoord|secret|client_secret|token|github_token|api_key(?:_value)?|access_key_id|secret_access_key|burgerservicenummer|bsn)\b[^:=\n]*[:=]\s*[\"']?([^\"'\s,`]+)"
     ),
 )
+RAW_SECRET_BLOB_PATTERN = re.compile(r"^[A-Za-z0-9+/=_-]{24,}$")
 
 
 def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -48,6 +49,20 @@ def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def looks_like_secret_blob(text: str) -> bool:
+    stripped = text.strip()
+    if not RAW_SECRET_BLOB_PATTERN.fullmatch(stripped):
+        return False
+    if re.fullmatch(r"[0-9a-fA-F]{32,}", stripped):
+        return True
+    classes = 0
+    classes += bool(re.search(r"[A-Z]", stripped))
+    classes += bool(re.search(r"[a-z]", stripped))
+    classes += bool(re.search(r"[0-9]", stripped))
+    classes += bool(re.search(r"[+/=_-]", stripped))
+    return len(stripped) >= 32 and classes >= 3
+
+
 def highlight_sensitive_text(text: str) -> str:
     spans: list[tuple[int, int]] = []
     for pattern in FULL_VALUE_HIGHLIGHT_PATTERNS:
@@ -56,6 +71,10 @@ def highlight_sensitive_text(text: str) -> str:
     for pattern in ASSIGNMENT_VALUE_PATTERNS:
         for match in pattern.finditer(text):
             spans.append((match.start(1), match.end(1)))
+    if not spans and looks_like_secret_blob(text):
+        stripped = text.strip()
+        start = text.find(stripped)
+        spans.append((start, start + len(stripped)))
     if not spans:
         return text
     pieces: list[str] = []

@@ -651,6 +651,41 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("\u001b[", rendered)
         self.assertIn(f"password={cli.colorize('secret', 'critical')}", rendered)
 
+    def test_render_terminal_report_highlights_raw_secret_blobs(self) -> None:
+        blob = "/ETA2urp4UnyL7jLGSgn9O3aZXb+fIqD36Nc1s8UygLIQ5cvCv4YPg687+OOwXoTc9xATUV+oKoTAYDwKskvxjmQ"
+        report = "\n".join(
+            [
+                "# Sensitive Report",
+                "",
+                "## Secret and Credential Findings",
+                "- [high] credential in handout.zip via trufflehog",
+                f"  Evidence: `{blob}`",
+            ]
+        )
+
+        rendered = cli.render_terminal_report(report)
+
+        self.assertIn(cli.colorize(blob, "critical"), rendered)
+
+    def test_render_terminal_report_highlights_file_password_value_only(self) -> None:
+        report = "\n".join(
+            [
+                "# Sensitive Report",
+                "",
+                "## Secret and Credential Findings",
+                "- [high] credential in README.md via pattern:password-assignment",
+                "  Evidence: `File Password : 73c1818c4ee40dcc567fb5457f3ff9199714ee7272df573a59ae40113064b889`",
+            ]
+        )
+
+        rendered = cli.render_terminal_report(report)
+
+        self.assertIn("File Password :", rendered)
+        self.assertIn(
+            f"File Password : {cli.colorize('73c1818c4ee40dcc567fb5457f3ff9199714ee7272df573a59ae40113064b889', 'critical')}",
+            rendered,
+        )
+
     def test_cli_standard_output_shows_progress_and_full_report(self) -> None:
         import subprocess
 
