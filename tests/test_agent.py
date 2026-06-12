@@ -393,6 +393,30 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(any(action.kind == "content_search" for action in actions))
         self.assertTrue(any("document_analyst -> credential_hunter" in note for note in notes))
 
+    def test_build_cross_role_handoff_plan_preserves_origin_hypothesis_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "docs" / "vpn.txt"
+            path.parent.mkdir(parents=True)
+            path.write_text("temporary login token for vpn\n", encoding="utf-8")
+            observations = [
+                cli.AgentObservation(
+                    path="docs/vpn.txt",
+                    evidence="temporary login token for vpn",
+                    source_mechanism="read_head",
+                    confidence=0.92,
+                    role="document_analyst",
+                    hypothesis_label="VPN token reuse",
+                    derived_claim="Found likely login material",
+                )
+            ]
+
+            hypotheses, actions, _ = cli.build_cross_role_handoff_plan(target, observations, [], 4)
+
+        self.assertTrue(any(item.role == "credential_hunter" and item.label == "VPN token reuse" for item in hypotheses))
+        self.assertTrue(any("VPN token reuse" in item.notes for item in hypotheses))
+        self.assertTrue(any(action.role == "credential_hunter" and action.hypothesis_label == "VPN token reuse" for action in actions))
+
     @mock.patch("doc_triage.cli.request_agent_plan")
     def test_plan_cross_role_replans_requests_role_specific_replan(self, request_agent_plan: mock.Mock) -> None:
         request_agent_plan.return_value = (
@@ -1846,6 +1870,7 @@ class AgentModeTests(unittest.TestCase):
                         source_mechanism="read_head",
                         confidence=0.9,
                         role="document_analyst",
+                        hypothesis_label="VPN token reuse",
                         derived_claim="Found likely login material",
                     )
                 ],
@@ -1859,6 +1884,7 @@ class AgentModeTests(unittest.TestCase):
                         source_mechanism="content_search",
                         confidence=0.8,
                         role="credential_hunter",
+                        hypothesis_label="VPN token reuse",
                         derived_claim="Credential hunter confirmed login material",
                     )
                 ],
@@ -1872,6 +1898,8 @@ class AgentModeTests(unittest.TestCase):
             (target / "docs" / "a.txt").write_text("temporary password: Welkom123\n", encoding="utf-8")
 
             run = cli.run_agent_mode(target, [], args)
+
+        self.assertTrue(any(observation.role == "credential_hunter" and observation.hypothesis_label == "VPN token reuse" for observation in run.observations))
 
         self.assertGreaterEqual(execute_agent_actions.call_count, 2)
         followup_actions = execute_agent_actions.call_args_list[1].args[1]

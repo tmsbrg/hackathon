@@ -423,16 +423,25 @@ def build_cross_role_handoff_plan(
         if len(actions) >= action_budget:
             break
         source_role = observation.role.strip() or infer_agent_role(observation.derived_claim, source=observation.path)
+        base_label = observation.hypothesis_label.strip() or f"Handoff from {source_role} for {observation.path}"
         for target_role, reason in infer_observation_handoff_targets(observation):
             if len(actions) >= action_budget:
                 break
             hypothesis = AgentHypothesis(
-                label=f"Handoff from {source_role} for {observation.path}",
-                rationale=reason,
+                label=base_label,
+                rationale=(
+                    f"{reason} Source subagent {source_role} observed {observation.path}."
+                    if observation.hypothesis_label
+                    else reason
+                ),
                 status="inconclusive",
                 role=target_role,
                 evidence_paths=[observation.path],
-                notes=f"Spawned from observation by {source_role}.",
+                notes=(
+                    f"Spawned from observation by {source_role} while testing hypothesis '{observation.hypothesis_label}'."
+                    if observation.hypothesis_label
+                    else f"Spawned from observation by {source_role}."
+                ),
             )
             hypothesis_key = (hypothesis.role, hypothesis.label, hypothesis.rationale)
             if hypothesis_key not in hypothesis_keys:
@@ -441,6 +450,7 @@ def build_cross_role_handoff_plan(
             action = _handoff_action_for_observation(target, observation, target_role, reason)
             if action is None:
                 continue
+            action.hypothesis_label = observation.hypothesis_label.strip() or hypothesis.label
             action_key = (action.kind, action.path, action.query, hashlib.sha256(action.code.encode("utf-8")).hexdigest())
             if action_key in existing_keys:
                 continue
