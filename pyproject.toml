@@ -6,7 +6,29 @@ build-backend = "setuptools.build_meta"
 name = "doc-triage"
 version = "0.1.0"
 description = "Local document triage CLI for high-value findings."
+readme = "README.md"
+keywords = ["dfir", "triage", "forensics", "ollama", "ocr", "secrets"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Utilities",
+]
 requires-python = ">=3.12"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/tmsbrg/hackathon"
+Issues = "https://github.com/tmsbrg/hackathon/issues"
 
 [project.scripts]
 doc-triage = "doc_triage.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["doc_triage*"]

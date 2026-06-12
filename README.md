@@ -1,49 +1,99 @@
 # doc-triage
 
-`doc-triage` scans a local folder or mounted share for likely secrets, credentials, personal data, and other high-value documents. It writes a single Markdown report and does not keep a database.
+`doc-triage` is a dependency-light local triage CLI for scanning an authorized directory or mounted share for high-value findings. It combines deterministic scanners (`rg`, `rga`, TruffleHog, optional OCR) with an optional local Ollama-backed agent loop, then writes one self-contained Markdown report.
 
 The report may contain verbatim secrets. Treat it like sensitive evidence.
 
-## What it does
+## Current scope
 
-- Walks a target directory and scores interesting files.
-- Uses built-in text matching plus external tools like `rga` and TruffleHog.
-- Can OCR images and PDFs when `--ocr` is enabled.
-- Can ask a local Ollama model to summarize and prioritize findings.
-- Writes reports with mode `0600`.
+- Linux only
+- Python 3.12+
+- Local files or already-mounted shares
+- Local-only Ollama usage
+- No database, web UI, or persistent extraction cache
 
-## Quick start
+## Features
 
-Install the package:
+- Deterministic scanning for credentials, flags, personal data, and sensitive filenames
+- Optional OCR for images and PDFs
+- Optional agent mode that profiles the dataset, proposes read-only follow-up actions, executes them, and summarizes results
+- Restrictive report permissions (`0600`)
+- Verbose terminal progress, including raw planner/refinement output in `--verbose` mode
+
+## Install
+
+Install the package in editable mode:
 
 ```bash
 python3 -m pip install -e .
 ```
 
-Check what is missing on the current machine:
+There are no required Python runtime dependencies beyond the standard library. External scanners are invoked as subprocesses.
+
+## CLI
+
+Top-level commands:
+
+```text
+doc-triage doctor
+doc-triage scan TARGET
+  [--output PATH]
+  [--model NAME]
+  [--ollama-url URL]
+  [--ocr]
+  [--max-files N]
+  [--max-llm-files N]
+  [--exclude GLOB]
+  [--no-llm]
+  [--agent]
+  [--agent-max-actions N]
+  [--agent-timeout SECONDS]
+  [--model-retries N]
+  [--verbose]
+```
+
+Useful defaults:
+
+- `--output ./report.md`
+- `--model huihui_ai/qwen3.5-abliterated:9b`
+- `--ollama-url http://127.0.0.1:11434`
+- `--max-llm-files 30`
+- `--agent-max-actions 8`
+- `--agent-timeout 30`
+- `--model-retries 1`
+
+## Quick start
+
+Check the current machine first:
 
 ```bash
 doc-triage doctor
 ```
 
-Run a deterministic scan without any LLM calls:
+Run a deterministic scan:
 
 ```bash
 doc-triage scan /path/to/share --output report.md --no-llm
 ```
 
-Run with OCR and Ollama:
+Run with OCR:
 
 ```bash
-doc-triage scan /path/to/share --output report.md --ocr --model huihui_ai/qwen3.5-abliterated:9b
+doc-triage scan /path/to/share --output report.md --ocr --no-llm
 ```
 
-Run the new agentic mode, which profiles the dataset, chooses context-specific follow-up reads/searches, and adds agent provenance to the report:
+Run with the local model summary path:
+
+```bash
+doc-triage scan /path/to/share --output report.md --model huihui_ai/qwen3.5-abliterated:9b
+```
+
+Run the agent loop with verbose planning output:
 
 ```bash
 doc-triage --verbose scan /path/to/share \
   --output report.md \
-  --model huihui_ai/qwen3.5-abliterated:9b \
+  --model haervwe/GLM-4.6V-Flash-9B \
   --agent \
   --agent-max-actions 8 \
   --agent-timeout 30
@@ -55,25 +105,29 @@ Exclude noisy paths:
 doc-triage scan /path/to/share --output report.md --exclude '*.zip' --exclude 'tmp/*'
 ```
 
-## Dependencies
+## External tools
 
-Required for the full scan path:
+Required for the full deterministic scanner path:
 
-- `ripgrep`
-- `ripgrep-all`
+- `rg`
+- `rga`
 - `trufflehog`
 
-Optional but useful:
+Optional:
 
 - `tesseract` for image OCR
 - `ocrmypdf` and `pdftotext` for scanned PDFs
-- `ollama` for local LLM summaries
+- `exiftool` for metadata extraction in agent mode
+- `ollama` for local summaries and agent planning
+- `bwrap` for sandboxed generated helpers
 
-Base Ubuntu packages:
+### Ubuntu notes
+
+Base packages:
 
 ```bash
 sudo apt update
-sudo apt install ripgrep tesseract-ocr poppler-utils
+sudo apt install ripgrep tesseract-ocr poppler-utils exiftool
 ```
 
 Recommended extras:
@@ -87,67 +141,101 @@ curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scr
 
 # OCR for PDFs
 sudo apt install ocrmypdf
+
+# Bubblewrap sandbox
+sudo apt install bubblewrap
 ```
 
-Ollama setup is covered below.
+## Supported document types
 
-## Common commands
+The list below is intentionally limited to what the current code path demonstrably handles today.
 
-Check dependencies and versions:
+### Direct deterministic content scanning
 
-```bash
-doc-triage doctor
-```
+These file types are read directly by the built-in Python scanner when they are plain local files:
 
-Scan without LLM analysis:
+- `.txt`
+- `.md`
+- `.cfg`
+- `.conf`
+- `.log`
+- `.ini`
+- `.json`
+- `.yaml`
+- `.yml`
+- `.csv`
 
-```bash
-doc-triage scan /mnt/share --output report.md --no-llm
-```
+Sensitive filename rules also apply to specific names regardless of extension, including:
 
-Show stage-by-stage progress during a test run:
+- `.env`
+- `id_rsa`
+- `id_dsa`
+- `credentials.txt`
+- `secrets.txt`
+- `config.ovpn`
 
-```bash
-doc-triage --verbose scan /mnt/share --output report.md --no-llm
-```
+### OCR-backed scanning
 
-Scan with OCR:
+When `--ocr` is enabled:
 
-```bash
-doc-triage scan /mnt/share --output report.md --ocr --no-llm
-```
+- image OCR is supported for:
+  - `.png`
+  - `.jpg`
+  - `.jpeg`
+  - `.tif`
+  - `.tiff`
+  - `.bmp`
+- PDF OCR / text extraction is supported for:
+  - `.pdf`
 
-Scan with OCR and a local model:
+### Agent/helper-supported artifact types
 
-```bash
-doc-triage scan /mnt/share --output report.md --ocr --model huihui_ai/qwen3.5-abliterated:9b
-```
+The agent loop and helper actions can currently inspect or triage:
 
-Scan with the agent loop enabled:
+- email artifacts:
+  - `.eml`
+- archive/container types:
+  - `.zip`
+  - `.7z`
+  - `.tar`
+  - `.gz`
+  - `.tgz`
+  - `.bz2`
+  - `.xz`
+  - `.rar`
+- images via OCR / metadata:
+  - `.png`
+  - `.jpg`
+  - `.jpeg`
+  - `.tif`
+  - `.tiff`
+  - `.bmp`
+- PDFs via `pdftotext`
+  - `.pdf`
 
-```bash
-doc-triage --verbose scan /mnt/share --output report.md --agent --model huihui_ai/qwen3.5-abliterated:9b
-```
+In addition, the agent reconnaissance path samples these text-like types when building context:
 
-## Report shape
+- `.xml`
+- `.html`
+- `.tsv`
 
-Every report includes:
+### Generic file-level inspection
 
-1. Scope and scan settings
-2. Coverage warnings
-3. Executive summary
-4. Ranked findings
-5. Secret and credential findings
-6. Personal and financial findings
-7. Interesting document relationships
-8. Files to review first
+Even when no type-specific extractor applies, the current agent path can still do bounded inspection through:
 
-When `--agent` is enabled the report also adds:
+- directory listing
+- filename/path search
+- regex content search via `rga`
+- `file(1)` type inspection
+- `strings` on binary-like files
 
-9. Agent investigation plan
-10. Agent observations
-11. Rejected hypotheses
-12. Agent coverage and limitations
+### Not a promise of full parsing support
+
+Current support does **not** mean first-class parsing for every office, mail, archive, or forensic artifact format. For example:
+
+- `.docx`, `.xlsx`, `.pptx`, SQLite, and PCAP are not yet handled by dedicated built-in parsers
+- those files may still be partially surfaced by `rga`, filenames, `file`, `strings`, or model-chosen helper actions
+- if a parser is missing or the model chooses an incompatible action, `doc-triage` records a warning and continues
 
 ## Ollama setup
 
@@ -163,16 +251,16 @@ Start the service:
 systemctl --user enable --now ollama
 ```
 
-If your install uses a system service instead:
+If your setup uses a system service instead:
 
 ```bash
 sudo systemctl enable --now ollama
 ```
 
-Pull the abliterated default model:
+Pull a local model:
 
 ```bash
-ollama pull huihui_ai/qwen3.5-abliterated:9b
+ollama pull haervwe/GLM-4.6V-Flash-9B
 ```
 
 Verify:
@@ -182,9 +270,50 @@ ollama list
 doc-triage doctor
 ```
 
-## Notes
+## What the report contains
 
-- Missing external scanners produce warnings in the report and a non-zero exit code.
-- OCR is opt-in and only writes to a temporary workspace.
-- Source files are never modified.
+Every report includes:
+
+1. Scope and scan settings
+2. Coverage and warnings
+3. Executive summary
+4. Ranked findings
+5. Secret and credential findings
+6. Personal and financial findings
+7. Interesting documents and relationships
+8. Files to review first
+
+When `--agent` is enabled, the report also adds:
+
+9. Agent investigation plan
+10. Agent observations
+11. Rejected hypotheses
+12. Agent coverage and limitations
+
+## Terminal output
+
+Normal mode prints a concise colorized summary.
+
+`--verbose` additionally prints:
+
+- scan stage progress
+- raw agent planner output
+- raw agent refinement output
+- LLM/agent warnings as they happen
+
+Deterministic findings use specific detector labels where possible, for example:
+
+- `pattern:flag-artifact`
+- `pattern:password-assignment`
+- `pattern:set-cookie-httponly`
+- `bsn-validator`
+- `filename-rule`
+- `rga`
+- `trufflehog`
+
+## Safety notes
+
 - Use this only on data you are authorized to inspect.
+- Source files are never modified.
+- OCR and helper execution use temporary workspaces only.
+- Missing scanners or partial failures still produce a report, but the command may exit non-zero.
