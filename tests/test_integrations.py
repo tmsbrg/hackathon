@@ -172,6 +172,93 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn("Contains a password", report)
             self.assertIn("a.txt references internal access material", report)
 
+    def test_render_report_formats_structured_llm_objects(self) -> None:
+        args = cli.build_parser().parse_args(["scan", "/tmp/example"])
+        finding = cli.Finding(
+            source="a.txt",
+            category="credential",
+            severity="high",
+            detector="rga",
+            evidence="password=secret",
+            line=1,
+            confidence=0.9,
+            metadata={},
+        )
+        llm_summary = {
+            "executive_summary": "summary",
+            "priority_findings": [
+                {"source": "a.txt", "why": "Contains a password"},
+                {"source_path": "b.txt", "description": "Contains an API token"},
+                {"source_path": "c.txt", "claim": "Contains a suspicious cookie", "context": "Legacy cookie found"},
+            ],
+            "relationships": [
+                {"type": "cross_domain", "description": "a.txt relates to b.txt", "source_paths": ["a.txt", "b.txt"]},
+                {"relationship_type": "attribute_binding", "inference": "cookie binds to example.com", "source_path": "c.txt"},
+                "legacy note",
+            ],
+            "review_order": ["a.txt", "b.txt"],
+        }
+
+        report = cli.render_report(args, Path("/tmp/example"), [finding], [], llm_summary=llm_summary)
+
+        self.assertIn("a.txt: Contains a password", report)
+        self.assertIn("b.txt: Contains an API token", report)
+        self.assertIn("c.txt: Contains a suspicious cookie", report)
+        self.assertIn("cross_domain: a.txt relates to b.txt", report)
+        self.assertIn("Sources: a.txt, b.txt", report)
+        self.assertIn("attribute_binding: cookie binds to example.com", report)
+        self.assertIn("Sources: c.txt", report)
+
+    def test_normalize_llm_summary_fills_missing_priority_sources_from_review_order(self) -> None:
+        llm_summary = {
+            "executive_summary": "summary",
+            "priority_findings": [
+                {"claim": "Contains a suspicious cookie"},
+                {"description": "Contains a blockchain identifier"},
+            ],
+            "relationships": [],
+            "review_order": ["sequence/ctf/sequence.txt", "bad_blockchain/ctf/bad-blockchain.txt"],
+        }
+
+        normalized = cli.normalize_llm_summary(llm_summary)
+
+        self.assertEqual(
+            normalized["priority_findings"][0]["source_path"],
+            "sequence/ctf/sequence.txt",
+        )
+        self.assertEqual(
+            normalized["priority_findings"][1]["source_path"],
+            "bad_blockchain/ctf/bad-blockchain.txt",
+        )
+
+    def test_render_report_ignores_non_path_review_order_entries(self) -> None:
+        args = cli.build_parser().parse_args(["scan", "/tmp/example"])
+        finding = cli.Finding(
+            source="a.txt",
+            category="credential",
+            severity="high",
+            detector="rga",
+            evidence="password=secret",
+            line=1,
+            confidence=0.9,
+            metadata={},
+        )
+        llm_summary = {
+            "executive_summary": "summary",
+            "priority_findings": [{"source": "a.txt", "why": "Contains a password"}],
+            "relationships": [],
+            "review_order": [
+                "1. Investigate timestamp first",
+                "2. Cross-reference domain second",
+            ],
+        }
+
+        report = cli.render_report(args, Path("/tmp/example"), [finding], [], llm_summary=llm_summary)
+
+        self.assertIn("## Files Recommended for Manual Review", report)
+        self.assertIn("- a.txt", report)
+        self.assertNotIn("1. Investigate timestamp first", report)
+
 
 if __name__ == "__main__":
     unittest.main()

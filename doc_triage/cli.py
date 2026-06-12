@@ -636,6 +636,7 @@ def generate_llm_summary(ollama_url: str, model: str, findings: list[Finding], m
             {
                 "model": model,
                 "stream": False,
+                "think": False,
                 "format": "json",
                 "prompt": json.dumps(prompt),
             },
@@ -652,6 +653,7 @@ def generate_llm_summary(ollama_url: str, model: str, findings: list[Finding], m
                 {
                     "model": model,
                     "stream": False,
+                    "think": False,
                     "format": "json",
                     "prompt": (
                         "Repair the previous answer into strict JSON with keys "
@@ -731,7 +733,7 @@ def render_report(
     lines.extend(["", "## Interesting Documents and Relationships"])
     if llm_summary and llm_summary.get("relationships"):
         for relationship in llm_summary["relationships"]:
-            lines.append(f"- {relationship}")
+            lines.extend(render_relationship(relationship))
     elif findings:
         lines.append("- Manual review should start with the highest-severity files listed below.")
     else:
@@ -740,13 +742,11 @@ def render_report(
     if llm_summary and llm_summary.get("priority_findings"):
         lines.extend(["", "## LLM Priority Findings"])
         for item in llm_summary["priority_findings"]:
-            source = item.get("source", "<unknown>") if isinstance(item, dict) else "<unknown>"
-            why = item.get("why", "") if isinstance(item, dict) else str(item)
-            lines.append(f"- {source}: {why}")
+            lines.append(render_priority_item(item))
 
     lines.extend(["", "## Files Recommended for Manual Review"])
     review_order = llm_summary.get("review_order") if llm_summary else None
-    if review_order:
+    if isinstance(review_order, list) and review_order and all(looks_like_source_path(source) for source in review_order):
         for source in review_order:
             lines.append(f"- {source}")
     elif findings:
@@ -757,6 +757,60 @@ def render_report(
 
     lines.append("")
     return "\n".join(lines)
+
+
+def render_relationship(item: object) -> list[str]:
+    if isinstance(item, dict):
+        relation_type = str(item.get("type") or item.get("relationship_type") or "relationship")
+        description = str(item.get("description") or item.get("inference") or "").strip()
+        sources = item.get("source_paths")
+        if not sources and item.get("source_path"):
+            sources = [item.get("source_path")]
+        lines = [f"- {relation_type}: {description}".rstrip()]
+        if isinstance(sources, list) and sources:
+            lines.append(f"  Sources: {', '.join(str(source) for source in sources)}")
+        return lines
+    return [f"- {item}"]
+
+
+def normalize_llm_summary(summary: dict[str, object]) -> dict[str, object]:
+    priority_findings = summary.get("priority_findings")
+    review_order = summary.get("review_order")
+    if not isinstance(priority_findings, list) or not isinstance(review_order, list):
+        return summary
+
+    normalized_items: list[object] = []
+    for index, item in enumerate(priority_findings):
+        if isinstance(item, dict) and not item.get("source") and not item.get("source_path"):
+            if index < len(review_order) and isinstance(review_order[index], str) and review_order[index].strip():
+                updated_item = dict(item)
+                updated_item["source_path"] = review_order[index]
+                normalized_items.append(updated_item)
+                continue
+        normalized_items.append(item)
+
+    normalized_summary = dict(summary)
+    normalized_summary["priority_findings"] = normalized_items
+    return normalized_summary
+
+
+def looks_like_source_path(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if candidate[:1].isdigit() and ". " in candidate:
+        return False
+    return "/" in candidate or "." in Path(candidate).name
+
+
+def render_priority_item(item: object) -> str:
+    if isinstance(item, dict):
+        source = item.get("source") or item.get("source_path") or "<source missing>"
+        reason = item.get("why") or item.get("description") or item.get("claim") or item.get("rationale") or ""
+        return f"- {source}: {reason}".rstrip()
+    return f"- {item}"
 
 
 def render_findings(findings: list[Finding]) -> list[str]:
@@ -798,6 +852,7 @@ def run_scan(args: argparse.Namespace) -> int:
         verbose_log(args.verbose, f"Requesting LLM summary with model {args.model}")
         try:
             llm_summary = generate_llm_summary(args.ollama_url, args.model, findings, args.max_llm_files)
+            llm_summary = normalize_llm_summary(llm_summary)
             verbose_log(args.verbose, "LLM summary completed")
         except RuntimeError as exc:
             warnings.append(str(exc))
