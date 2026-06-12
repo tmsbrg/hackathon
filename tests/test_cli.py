@@ -35,6 +35,21 @@ class CliContractTests(unittest.TestCase):
             mode = stat.S_IMODE(output.stat().st_mode)
             self.assertEqual(mode, 0o600)
 
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_verbose_prints_progress_messages(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, "target")
+            target.mkdir()
+            Path(target, "note.txt").write_text("password=secret123\n", encoding="utf-8")
+            output = Path(tmpdir, "report.md")
+            stdout = StringIO()
+
+            with mock.patch("sys.stdout", stdout):
+                cli.main(["--verbose", "scan", str(target), "--output", str(output), "--no-llm"])
+
+            self.assertIn("[doc-triage] Starting scan", stdout.getvalue())
+            self.assertIn("[doc-triage] Report written successfully", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

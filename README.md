@@ -1,31 +1,71 @@
 # doc-triage
 
-`doc-triage` scans an authorized local directory or mounted share for likely high-value documents, credentials, secrets, and personal or financial data. It writes a single Markdown report and keeps findings in memory.
+`doc-triage` scans a local folder or mounted share for likely secrets, credentials, personal data, and other high-value documents. It writes a single Markdown report and does not keep a database.
 
-The report may include verbatim secrets. Treat it like sensitive material.
+The report may contain verbatim secrets. Treat it like sensitive evidence.
 
-## Features
+## What it does
 
-- `doctor` checks required scanners, optional OCR tools, and local LLM availability.
-- `scan` combines filename heuristics, built-in text matching, `ripgrep-all`, TruffleHog, optional OCR, and optional Ollama summarization.
-- Reports are written with mode `0600`.
+- Walks a target directory and scores interesting files.
+- Uses built-in text matching plus external tools like `rga` and TruffleHog.
+- Can OCR images and PDFs when `--ocr` is enabled.
+- Can ask a local Ollama model to summarize and prioritize findings.
+- Writes reports with mode `0600`.
 
-## Install
+## Quick start
 
-Python:
+Install the package:
 
 ```bash
 python3 -m pip install -e .
 ```
 
-Ubuntu toolchain:
+Check what is missing on the current machine:
+
+```bash
+doc-triage doctor
+```
+
+Run a deterministic scan without any LLM calls:
+
+```bash
+doc-triage scan /path/to/share --output report.md --no-llm
+```
+
+Run with OCR and Ollama:
+
+```bash
+doc-triage scan /path/to/share --output report.md --ocr --model huihui_ai/qwen3.5-abliterated:9b
+```
+
+Exclude noisy paths:
+
+```bash
+doc-triage scan /path/to/share --output report.md --exclude '*.zip' --exclude 'tmp/*'
+```
+
+## Dependencies
+
+Required for the full scan path:
+
+- `ripgrep`
+- `ripgrep-all`
+- `trufflehog`
+
+Optional but useful:
+
+- `tesseract` for image OCR
+- `ocrmypdf` and `pdftotext` for scanned PDFs
+- `ollama` for local LLM summaries
+
+Base Ubuntu packages:
 
 ```bash
 sudo apt update
 sudo apt install ripgrep tesseract-ocr poppler-utils
 ```
 
-Recommended extra tools:
+Recommended extras:
 
 ```bash
 # ripgrep-all
@@ -34,31 +74,88 @@ cargo install ripgrep_all
 # TruffleHog
 curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh
 
-# Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
 # OCR for PDFs
 sudo apt install ocrmypdf
 ```
 
-## Usage
+Ollama setup is covered below.
 
-Check dependencies:
+## Common commands
+
+Check dependencies and versions:
 
 ```bash
 doc-triage doctor
 ```
 
-Scan a folder without LLM analysis:
+Scan without LLM analysis:
 
 ```bash
 doc-triage scan /mnt/share --output report.md --no-llm
 ```
 
-Scan with OCR and Ollama:
+Show stage-by-stage progress during a test run:
 
 ```bash
-doc-triage scan /mnt/share --output report.md --ocr --model qwen3:8b
+doc-triage --verbose scan /mnt/share --output report.md --no-llm
+```
+
+Scan with OCR:
+
+```bash
+doc-triage scan /mnt/share --output report.md --ocr --no-llm
+```
+
+Scan with OCR and a local model:
+
+```bash
+doc-triage scan /mnt/share --output report.md --ocr --model huihui_ai/qwen3.5-abliterated:9b
+```
+
+## Report shape
+
+Every report includes:
+
+1. Scope and scan settings
+2. Coverage warnings
+3. Executive summary
+4. Ranked findings
+5. Secret and credential findings
+6. Personal and financial findings
+7. Interesting document relationships
+8. Files to review first
+
+## Ollama setup
+
+Install Ollama:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+Start the service:
+
+```bash
+systemctl --user enable --now ollama
+```
+
+If your install uses a system service instead:
+
+```bash
+sudo systemctl enable --now ollama
+```
+
+Pull the abliterated default model:
+
+```bash
+ollama pull huihui_ai/qwen3.5-abliterated:9b
+```
+
+Verify:
+
+```bash
+ollama list
+doc-triage doctor
 ```
 
 ## Notes

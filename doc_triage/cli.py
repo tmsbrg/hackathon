@@ -79,6 +79,7 @@ class Finding:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="doc-triage")
+    parser.add_argument("--verbose", action="store_true")
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("doctor")
@@ -86,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan = subparsers.add_parser("scan")
     scan.add_argument("target")
     scan.add_argument("--output", default="./report.md")
-    scan.add_argument("--model", default="qwen3:8b")
+    scan.add_argument("--model", default="huihui_ai/qwen3.5-abliterated:9b")
     scan.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     scan.add_argument("--ocr", action="store_true")
     scan.add_argument("--max-files", type=int)
@@ -120,6 +121,11 @@ def ollama_health(ollama_url: str = "http://127.0.0.1:11434") -> tuple[bool, str
     if not names:
         return True, "healthy (no local models)"
     return True, f"healthy ({', '.join(names)})"
+
+
+def verbose_log(enabled: bool, message: str) -> None:
+    if enabled:
+        print(f"[doc-triage] {message}")
 
 
 def run_doctor() -> int:
@@ -386,6 +392,7 @@ def scan_target(
     max_files: int | None,
     ocr: bool = False,
     exclude_globs: Sequence[str] | None = None,
+    verbose: bool = False,
 ) -> tuple[list[Finding], list[str]]:
     warnings: list[str] = []
     findings: list[Finding] = []
@@ -401,9 +408,11 @@ def scan_target(
         warnings.append(f"File limit reached at {max_files} files.")
         files = files[:max_files]
 
+    verbose_log(verbose, f"Scanning {len(files)} files under {target}")
     external_findings, external_warnings = run_external_scanners(target, exclude_globs=exclude_globs)
     findings.extend(external_findings)
     warnings.extend(external_warnings)
+    verbose_log(verbose, f"External scanners produced {len(external_findings)} findings and {len(external_warnings)} warnings")
 
     for file_path in files:
         file_count += 1
@@ -422,6 +431,7 @@ def scan_target(
         findings.extend(keyword_findings(target, file_path, content))
 
     if ocr:
+        verbose_log(verbose, "OCR enabled; processing supported image and PDF files")
         with tempfile.TemporaryDirectory(prefix="doc-triage-ocr-") as temp_dir:
             temp_path = Path(temp_dir)
             register_tempdir(temp_path)
@@ -429,6 +439,7 @@ def scan_target(
             unregister_tempdir(temp_path)
         findings.extend(ocr_findings)
         warnings.extend(ocr_warnings)
+        verbose_log(verbose, f"OCR produced {len(ocr_findings)} findings and {len(ocr_warnings)} warnings")
 
     return deduplicate_findings(findings), warnings
 
@@ -523,7 +534,7 @@ def request_ollama_json(ollama_url: str, body: dict[str, object]) -> dict[str, o
     )
     with urlopen(request, timeout=30) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    response_text = payload.get("response", "{}")
+    response_text = payload.get("response") or payload.get("thinking") or "{}"
     return json.loads(response_text)
 
 
@@ -769,19 +780,43 @@ def run_scan(args: argparse.Namespace) -> int:
     if output_path.is_relative_to(target):
         exclude_globs.append(relative_source(target, output_path))
 
-    findings, warnings = scan_target(target, args.max_files, ocr=args.ocr, exclude_globs=exclude_globs)
+    verbose_log(args.verbose, f"Starting scan for {target}")
+    verbose_log(args.verbose, f"Writing report to {output_path}")
+    if exclude_globs:
+        verbose_log(args.verbose, f"Using exclude globs: {exclude_globs}")
+
+    findings, warnings = scan_target(
+        target,
+        args.max_files,
+        ocr=args.ocr,
+        exclude_globs=exclude_globs,
+        verbose=args.verbose,
+    )
+    verbose_log(args.verbose, f"Deterministic scan produced {len(findings)} findings and {len(warnings)} warnings")
     llm_summary: dict[str, object] | None = None
     if not args.no_llm and findings:
+        verbose_log(args.verbose, f"Requesting LLM summary with model {args.model}")
         try:
             llm_summary = generate_llm_summary(args.ollama_url, args.model, findings, args.max_llm_files)
+            verbose_log(args.verbose, "LLM summary completed")
         except RuntimeError as exc:
             warnings.append(str(exc))
+            verbose_log(args.verbose, f"LLM summary failed: {exc}")
+    elif args.no_llm:
+        verbose_log(args.verbose, "LLM summary disabled with --no-llm")
+    else:
+        verbose_log(args.verbose, "Skipping LLM summary because no findings were produced")
 
     report = render_report(args, target, findings, warnings, llm_summary=llm_summary)
     write_report(output_path, report)
+    verbose_log(args.verbose, "Report written successfully")
 
     statuses = detect_tools()
     missing_required = [tool.name for tool in statuses if tool.required and not tool.path]
+    if missing_required:
+        verbose_log(args.verbose, f"Missing required tools: {missing_required}")
+    if warnings:
+        verbose_log(args.verbose, f"Scan completed with warnings: {warnings}")
     return EXIT_ERROR if missing_required or warnings else EXIT_OK
 
 
