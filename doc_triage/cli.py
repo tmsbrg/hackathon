@@ -2,175 +2,137 @@ from __future__ import annotations
 
 import argparse
 import ast
-import fnmatch
 import hashlib
 import json
 import mimetypes
-import os
-import re
 import shutil
-import signal
-import stat
-import subprocess
 import sys
 import tempfile
 from collections import Counter
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-
-EXIT_OK = 0
-EXIT_ERROR = 1
-EXIT_USAGE = 2
-
-REQUIRED_TOOLS = ("rg", "rga", "trufflehog")
-OPTIONAL_OCR_TOOLS = ("tesseract", "ocrmypdf", "pdftotext")
-TEXT_EXTENSIONS = {".txt", ".md", ".cfg", ".conf", ".log", ".ini", ".json", ".yaml", ".yml", ".csv"}
-OCR_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-OCR_PDF_EXTENSIONS = {".pdf"}
-SENSITIVE_FILENAMES = {
-    ".env": ("credential", "high"),
-    "id_rsa": ("sensitive-file", "critical"),
-    "id_dsa": ("sensitive-file", "critical"),
-    "credentials.txt": ("credential", "high"),
-    "secrets.txt": ("credential", "high"),
-    "config.ovpn": ("sensitive-file", "medium"),
-}
-KEYWORD_RULES = {
-    "password": ("credential", "high", 0.95),
-    "iban": ("financial-data", "medium", 0.7),
-    "bsn": ("personal-data", "medium", 0.7),
-}
-SIGNAL_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, str, float]], ...] = (
-    (re.compile(r"\bpassword\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.95)),
-    (re.compile(r"\b(passwd|pwd)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.95)),
-    (re.compile(r"\b(secret|client_secret)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
-    (re.compile(r"\baws_secret_access_key\b", re.IGNORECASE), ("credential", "high", 0.95)),
-    (re.compile(r"\b(token|access_token|refresh_token)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
-    (re.compile(r"\bapi[_-]?key\b\s*[:=]?", re.IGNORECASE), ("credential", "high", 0.9)),
-    (re.compile(r"\bbearer\s+[A-Za-z0-9._-]+", re.IGNORECASE), ("credential", "high", 0.9)),
-    (re.compile(r"\bset-cookie\b.*\bhttponly\b", re.IGNORECASE), ("credential", "high", 0.9)),
-    (re.compile(r"\biban\b", re.IGNORECASE), ("financial-data", "medium", 0.7)),
-    (re.compile(r"\bbsn\b", re.IGNORECASE), ("personal-data", "medium", 0.7)),
-    (re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"), ("sensitive-file", "critical", 0.99)),
-    (re.compile(r"\bopenssh private key\b", re.IGNORECASE), ("sensitive-file", "critical", 0.98)),
+from .constants import (
+    EXIT_ERROR,
+    EXIT_OK,
+    EXIT_USAGE,
+    OPTIONAL_OCR_TOOLS,
+    OCR_IMAGE_EXTENSIONS,
+    OCR_PDF_EXTENSIONS,
+    REQUIRED_TOOLS,
+    SEVERITY_ORDER,
+    TEXT_EXTENSIONS,
 )
-DOC_NOISE_FILENAMES = {
-    "license",
-    "license.txt",
-    "license.md",
-    "readme",
-    "readme.txt",
-    "readme.md",
-    "contributing.md",
-    "copying",
-    "notice",
-    "notice.txt",
-}
-NOISE_PHRASES = (
-    "capture the flag",
-    "mit license",
-    "copyright",
-    "please see individual challenges",
-    "can you find",
-    "hint:",
+from .detectors import (
+    classify_match,
+    deduplicate_findings,
+    filename_finding,
+    glob_to_regex,
+    is_ignorable_rga_failure,
+    is_valid_bsn,
+    keyword_findings,
+    parse_rga_output,
+    parse_trufflehog_output,
+    relative_source,
+    rga_exclude_globs,
+    severity_rank,
+    should_exclude,
 )
-SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-REGISTERED_TEMPDIRS: set[Path] = set()
-ANSI_RESET = "\033[0m"
-ANSI_COLORS = {
-    "critical": "\033[1;31m",
-    "high": "\033[31m",
-    "medium": "\033[33m",
-    "low": "\033[36m",
-    "ok": "\033[32m",
-    "warning": "\033[33m",
-    "info": "\033[36m",
-}
+from .doctor import detect_tools as _detect_tools_impl
+from .doctor import ollama_health as _ollama_health_impl
+from .doctor import run_doctor as _run_doctor_impl
+from .models import (
+    AgentAction,
+    AgentHypothesis,
+    AgentObservation,
+    AgentRun,
+    CommandResult,
+    Finding,
+    HelperRequest,
+    ToolStatus,
+)
+from .reporting import (
+    is_fatal_warning,
+    looks_like_source_path,
+    normalize_llm_summary,
+    render_findings,
+    render_priority_item,
+    render_relationship,
+    render_report,
+    summarize_evidence,
+    summarize_findings,
+)
+from .runtime import (
+    cleanup_tempdirs,
+    colorize,
+    install_signal_handlers,
+    progress_log,
+    register_tempdir,
+    run_command,
+    safe_relative_path,
+    summarize_agent_action,
+    tool_version,
+    truncate_output,
+    unregister_tempdir,
+    verbose_log,
+    write_report,
+)
 
 
-@dataclass(slots=True)
-class ToolStatus:
-    name: str
-    path: str | None
-    required: bool
+def ollama_health(ollama_url: str = "http://127.0.0.1:11434") -> tuple[bool, str]:
+    request = Request(f"{ollama_url.rstrip('/')}/api/tags", method="GET")
+    try:
+        with urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return False, f"unreachable ({exc})"
+    models = payload.get("models", [])
+    if not isinstance(models, list):
+        return False, "invalid response"
+    names = [item.get("name", "<unknown>") for item in models if isinstance(item, dict)]
+    if not names:
+        return True, "healthy (no local models)"
+    return True, f"healthy ({', '.join(names)})"
 
 
-@dataclass(slots=True)
-class CommandResult:
-    exit_code: int
-    stdout: str
-    stderr: str
-    timed_out: bool
-    metadata: dict[str, bool] = field(default_factory=dict)
+def detect_tools() -> list[ToolStatus]:
+    statuses: list[ToolStatus] = []
+    for name in REQUIRED_TOOLS:
+        statuses.append(ToolStatus(name=name, path=shutil.which(name), required=True))
+    for name in OPTIONAL_OCR_TOOLS:
+        statuses.append(ToolStatus(name=name, path=shutil.which(name), required=False))
+    ollama_path = shutil.which("ollama")
+    healthy, _detail = ollama_health()
+    if ollama_path is None and healthy:
+        ollama_path = "<api-only>"
+    statuses.append(ToolStatus(name="ollama", path=ollama_path, required=False))
+    return statuses
 
 
-@dataclass(slots=True)
-class Finding:
-    source: str
-    category: str
-    severity: str
-    detector: str
-    evidence: str
-    line: int | None
-    confidence: float
-    metadata: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class HelperRequest:
-    kind: str
-    path: str
-    reason: str
-    limit: int = 20
-
-
-@dataclass(slots=True)
-class AgentHypothesis:
-    label: str
-    rationale: str
-    status: str = "inconclusive"
-    evidence_paths: list[str] = field(default_factory=list)
-    notes: str = ""
-
-
-@dataclass(slots=True)
-class AgentAction:
-    kind: str
-    reason: str
-    path: str = "."
-    query: str = ""
-    limit: int = 20
-    code: str = ""
-    metadata: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class AgentObservation:
-    path: str
-    evidence: str
-    source_mechanism: str
-    confidence: float
-    derived_claim: str = ""
-    action_kind: str = ""
-    exit_status: int = 0
-    truncated: bool = False
-    metadata: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class AgentRun:
-    hypotheses: list[AgentHypothesis] = field(default_factory=list)
-    actions: list[AgentAction] = field(default_factory=list)
-    observations: list[AgentObservation] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    llm_summary: dict[str, object] | None = None
-    sandbox_available: bool = False
-    generated_helpers_skipped: bool = False
+def run_doctor() -> int:
+    statuses = detect_tools()
+    missing_required = [tool.name for tool in statuses if tool.required and not tool.path]
+    print("Required")
+    for tool in [item for item in statuses if item.required]:
+        state = tool.path or "missing"
+        version = tool_version(tool.name) if tool.path else "n/a"
+        print(f"- {tool.name}: {state} [{version}]")
+    print("Optional OCR")
+    for tool in [item for item in statuses if not item.required and item.name != "ollama"]:
+        state = tool.path or "missing"
+        version = tool_version(tool.name) if tool.path else "n/a"
+        print(f"- {tool.name}: {state} [{version}]")
+    print("LLM")
+    ollama_status = next(item for item in statuses if item.name == "ollama")
+    if ollama_status.path:
+        _healthy, detail = ollama_health()
+        print(f"- ollama: {ollama_status.path} [{detail}]")
+    else:
+        print("- ollama: missing")
+    return EXIT_ERROR if missing_required else EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -194,440 +156,6 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--agent-max-actions", type=int, default=8)
     scan.add_argument("--agent-timeout", type=int, default=30)
     return parser
-
-
-def detect_tools() -> list[ToolStatus]:
-    statuses: list[ToolStatus] = []
-    for name in REQUIRED_TOOLS:
-        statuses.append(ToolStatus(name=name, path=shutil.which(name), required=True))
-    for name in OPTIONAL_OCR_TOOLS:
-        statuses.append(ToolStatus(name=name, path=shutil.which(name), required=False))
-    ollama_path = shutil.which("ollama")
-    healthy, _detail = ollama_health()
-    if ollama_path is None and healthy:
-        ollama_path = "<api-only>"
-    statuses.append(ToolStatus(name="ollama", path=ollama_path, required=False))
-    return statuses
-
-
-def ollama_health(ollama_url: str = "http://127.0.0.1:11434") -> tuple[bool, str]:
-    request = Request(f"{ollama_url.rstrip('/')}/api/tags", method="GET")
-    try:
-        with urlopen(request, timeout=5) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        return False, f"unreachable ({exc})"
-    models = payload.get("models", [])
-    if not isinstance(models, list):
-        return False, "invalid response"
-    names = [item.get("name", "<unknown>") for item in models if isinstance(item, dict)]
-    if not names:
-        return True, "healthy (no local models)"
-    return True, f"healthy ({', '.join(names)})"
-
-
-def verbose_log(enabled: bool, message: str) -> None:
-    if enabled:
-        print(f"[doc-triage] {message}")
-
-
-def progress_log(enabled: bool, stage: str, message: str) -> None:
-    if enabled:
-        print(f"[doc-triage] [{stage}] {message}")
-
-
-def summarize_agent_action(action: AgentAction) -> str:
-    target = action.query or action.path
-    return f"{action.kind}({target})"
-
-
-def run_doctor() -> int:
-    statuses = detect_tools()
-    missing_required = [tool.name for tool in statuses if tool.required and not tool.path]
-    print("Required")
-    for tool in [item for item in statuses if item.required]:
-        state = tool.path or "missing"
-        version = tool_version(tool.name) if tool.path else "n/a"
-        print(f"- {tool.name}: {state} [{version}]")
-    print("Optional OCR")
-    for tool in [item for item in statuses if not item.required and item.name != "ollama"]:
-        state = tool.path or "missing"
-        version = tool_version(tool.name) if tool.path else "n/a"
-        print(f"- {tool.name}: {state} [{version}]")
-    print("LLM")
-    ollama_status = next(item for item in statuses if item.name == "ollama")
-    if ollama_status.path:
-        healthy, detail = ollama_health()
-        print(f"- ollama: {ollama_status.path} [{detail}]")
-    else:
-        print("- ollama: missing")
-    return EXIT_ERROR if missing_required else EXIT_OK
-
-
-def truncate_output(value: str, max_output_chars: int) -> tuple[str, bool]:
-    if len(value) <= max_output_chars:
-        return value, False
-    truncated = value[:max_output_chars]
-    last_newline = truncated.rfind("\n")
-    if last_newline > 0:
-        truncated = truncated[: last_newline + 1]
-    return truncated, True
-
-
-def colorize(label: str, color: str) -> str:
-    return f"{ANSI_COLORS[color]}{label}{ANSI_RESET}"
-
-
-def summarize_evidence(text: str, limit: int = 120) -> str:
-    compact = " ".join(text.split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: limit - 3] + "..."
-
-
-def summarize_findings(
-    findings: list[Finding],
-    warnings: list[str],
-    agent_run: AgentRun | None = None,
-) -> list[str]:
-    by_severity = {severity: 0 for severity in SEVERITY_ORDER}
-    for finding in findings:
-        by_severity[finding.severity] = by_severity.get(finding.severity, 0) + 1
-
-    lines = [
-        colorize("Scan Summary", "info"),
-        f"  Findings: {len(findings)}  Warnings: {len(warnings)}",
-        "  Severity: "
-        + ", ".join(
-            f"{colorize(severity, severity)}={by_severity[severity]}"
-            for severity in ("critical", "high", "medium", "low")
-            if by_severity.get(severity, 0)
-        ),
-    ]
-
-    if warnings:
-        lines.append(f"  {colorize('Warnings', 'warning')}:")
-        for warning in warnings[:5]:
-            lines.append(f"    - {warning}")
-
-    ranked = sorted(
-        findings,
-        key=lambda finding: (
-            -SEVERITY_ORDER.get(finding.severity, 0),
-            -finding.confidence,
-            finding.source,
-            finding.line or -1,
-        ),
-    )
-    if ranked:
-        lines.append("  Top findings:")
-        for finding in ranked[:5]:
-            location = f"{finding.source}:{finding.line}" if finding.line is not None else finding.source
-            lines.append(
-                f"    - {colorize(finding.severity, finding.severity)} {location} [{finding.category}] via {finding.detector}"
-            )
-            lines.append(f"      Evidence: {summarize_evidence(finding.evidence)}")
-    if agent_run is not None:
-        confirmed = sum(1 for item in agent_run.hypotheses if item.status == "confirmed")
-        lines.append(
-            f"  Agent mode: actions={len(agent_run.actions)} observations={len(agent_run.observations)} "
-            f"confirmed_hypotheses={confirmed}"
-        )
-        if agent_run.warnings:
-            for warning in agent_run.warnings[:3]:
-                lines.append(f"    - {warning}")
-        for observation in agent_run.observations[:3]:
-            label = observation.derived_claim or observation.source_mechanism
-            lines.append(f"    - {observation.path} [{label}]")
-            lines.append(f"      Evidence: {summarize_evidence(observation.evidence)}")
-    return lines
-
-
-NON_FATAL_WARNING_PREFIXES = (
-    "agent summary failed:",
-    "agent refinement failed:",
-    "Ollama response repair failed:",
-    "Ollama response did not include the required JSON keys.",
-)
-
-
-def is_fatal_warning(warning: str) -> bool:
-    return not any(warning.startswith(prefix) for prefix in NON_FATAL_WARNING_PREFIXES)
-
-
-def safe_relative_path(target: Path, relative_path: str) -> Path | None:
-    candidate = (target / relative_path).resolve()
-    try:
-        candidate.relative_to(target)
-    except ValueError:
-        return None
-    return candidate
-
-
-def run_command(
-    command: list[str],
-    timeout: int = 30,
-    cwd: Path | None = None,
-    max_output_chars: int = 20000,
-) -> CommandResult:
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            cwd=str(cwd) if cwd is not None else None,
-            check=False,
-        )
-        stdout, stdout_truncated = truncate_output(completed.stdout, max_output_chars)
-        stderr, stderr_truncated = truncate_output(completed.stderr, max_output_chars)
-        return CommandResult(
-            exit_code=completed.returncode,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=False,
-            metadata={"stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated},
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout, stdout_truncated = truncate_output(exc.stdout or "", max_output_chars)
-        stderr, stderr_truncated = truncate_output(exc.stderr or "", max_output_chars)
-        return CommandResult(
-            exit_code=1,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=True,
-            metadata={"stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated},
-        )
-    except FileNotFoundError as exc:
-        return CommandResult(
-            exit_code=127,
-            stdout="",
-            stderr=str(exc),
-            timed_out=False,
-            metadata={"stdout_truncated": False, "stderr_truncated": False},
-        )
-
-
-def tool_version(name: str) -> str:
-    commands = {
-        "rg": [name, "--version"],
-        "rga": [name, "--version"],
-        "trufflehog": [name, "--version"],
-        "tesseract": [name, "--version"],
-        "ocrmypdf": [name, "--version"],
-        "pdftotext": [name, "-v"],
-        "ollama": [name, "--version"],
-    }
-    command = commands.get(name)
-    if command is None:
-        return "unknown"
-    result = run_command(command, timeout=5, max_output_chars=200)
-    if result.exit_code != 0:
-        return "unavailable"
-    first_line = (result.stdout or result.stderr).splitlines()
-    return first_line[0].strip() if first_line else "unknown"
-
-
-def register_tempdir(path: Path) -> None:
-    REGISTERED_TEMPDIRS.add(path)
-
-
-def unregister_tempdir(path: Path) -> None:
-    REGISTERED_TEMPDIRS.discard(path)
-
-
-def cleanup_tempdirs() -> None:
-    for path in list(REGISTERED_TEMPDIRS):
-        shutil.rmtree(path, ignore_errors=True)
-        unregister_tempdir(path)
-
-
-def install_signal_handlers() -> None:
-    def _handle_signal(signum: int, _frame: object) -> None:
-        cleanup_tempdirs()
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-
-def is_valid_bsn(value: str) -> bool:
-    digits = "".join(char for char in value if char.isdigit())
-    if len(digits) != 9:
-        return False
-    total = sum(int(digit) * factor for digit, factor in zip(digits[:8], range(9, 1, -1), strict=True))
-    total -= int(digits[-1])
-    return total % 11 == 0
-
-
-def write_report(path: Path, content: str) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(content)
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-
-
-def severity_rank(value: str) -> int:
-    return SEVERITY_ORDER.get(value, 0)
-
-
-def deduplicate_findings(findings: list[Finding]) -> list[Finding]:
-    deduped: dict[tuple[str, str, str], Finding] = {}
-    for finding in findings:
-        key = (finding.source, finding.category, finding.evidence.strip().lower())
-        current = deduped.get(key)
-        if current is None:
-            deduped[key] = finding
-            continue
-        if severity_rank(finding.severity) > severity_rank(current.severity):
-            deduped[key] = finding
-            continue
-        if severity_rank(finding.severity) == severity_rank(current.severity) and finding.confidence > current.confidence:
-            deduped[key] = finding
-    return sorted(
-        deduped.values(),
-        key=lambda finding: (-severity_rank(finding.severity), finding.source, finding.line or 0, finding.evidence),
-    )
-
-
-def is_noise_evidence(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return True
-    if sum(char.isalnum() for char in stripped) < 3:
-        return True
-    punctuation = sum(not char.isalnum() and not char.isspace() for char in stripped)
-    return punctuation >= max(4, len(stripped) - punctuation)
-
-
-def classify_match(text: str, source: str = "") -> tuple[str, str, float] | None:
-    if is_noise_evidence(text):
-        return None
-
-    stripped = text.strip()
-    lowered = stripped.lower()
-    source_name = Path(source).name.lower() if source else ""
-
-    for pattern, rule in SIGNAL_PATTERNS:
-        if pattern.search(stripped):
-            return rule
-
-    if stripped.startswith(("http://", "https://")):
-        return None
-    if source_name in DOC_NOISE_FILENAMES:
-        return None
-    if any(phrase in lowered for phrase in NOISE_PHRASES):
-        return None
-    return None
-
-
-def relative_source(target: Path, file_path: Path) -> str:
-    try:
-        return str(file_path.relative_to(target))
-    except ValueError:
-        return str(file_path)
-
-
-def filename_finding(target: Path, file_path: Path) -> Finding | None:
-    rule = SENSITIVE_FILENAMES.get(file_path.name.lower())
-    if rule is None:
-        return None
-    category, severity = rule
-    return Finding(
-        source=relative_source(target, file_path),
-        category=category,
-        severity=severity,
-        detector="filename-rule",
-        evidence=file_path.name,
-        line=None,
-        confidence=0.8,
-        metadata={},
-    )
-
-
-def keyword_findings(target: Path, file_path: Path, content: str) -> list[Finding]:
-    findings: list[Finding] = []
-    for line_number, line in enumerate(content.splitlines(), start=1):
-        classification = classify_match(line, relative_source(target, file_path))
-        if classification is not None:
-            category, severity, confidence = classification
-            findings.append(
-                Finding(
-                    source=relative_source(target, file_path),
-                    category=category,
-                    severity=severity,
-                    detector="built-in",
-                    evidence=line,
-                    line=line_number,
-                    confidence=confidence,
-                    metadata={},
-                )
-            )
-        for candidate in extract_digit_runs(line):
-            if is_valid_bsn(candidate):
-                findings.append(
-                    Finding(
-                        source=relative_source(target, file_path),
-                        category="personal-data",
-                        severity="high",
-                        detector="bsn-validator",
-                        evidence=line,
-                        line=line_number,
-                        confidence=0.95,
-                        metadata={"bsn": candidate, "validation": "valid"},
-                    )
-                )
-            elif len(candidate) == 9:
-                findings.append(
-                    Finding(
-                        source=relative_source(target, file_path),
-                        category="personal-data",
-                        severity="low",
-                        detector="bsn-candidate",
-                        evidence=line,
-                        line=line_number,
-                        confidence=0.3,
-                        metadata={"bsn": candidate, "validation": "candidate"},
-                    )
-                )
-    return findings
-
-
-def extract_digit_runs(text: str) -> list[str]:
-    return re.findall(r"\b\d{9}\b", text)
-
-
-def should_exclude(target: Path, file_path: Path, exclude_globs: Sequence[str]) -> bool:
-    relative = relative_source(target, file_path)
-    return any(fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(file_path.name, pattern) for pattern in exclude_globs)
-
-
-def glob_to_regex(pattern: str) -> str:
-    escaped: list[str] = []
-    for char in pattern:
-        if char == "*":
-            escaped.append(".*")
-        elif char == "?":
-            escaped.append(".")
-        else:
-            escaped.append(re.escape(char))
-    return "".join(escaped)
-
-
-def rga_exclude_globs(pattern: str) -> list[str]:
-    if pattern.startswith("*/"):
-        suffix = pattern[2:]
-        return [f"**/{suffix}", suffix]
-    return [pattern]
-
-
-def is_ignorable_rga_failure(result: CommandResult) -> bool:
-    if result.exit_code != 2:
-        return False
-    stderr = result.stderr.lower()
-    return "preprocessor command failed" in stderr or "error: during preprocessing" in stderr
 
 
 def scan_target(
@@ -802,77 +330,6 @@ def request_ollama_json(ollama_url: str, body: dict[str, object]) -> dict[str, o
         payload = json.loads(response.read().decode("utf-8"))
     response_text = payload.get("response") or payload.get("thinking") or "{}"
     return json.loads(response_text)
-
-
-def parse_rga_output(payload: str, target: Path) -> tuple[list[Finding], list[str]]:
-    findings: list[Finding] = []
-    warnings: list[str] = []
-    for raw_line in payload.splitlines():
-        if not raw_line.strip():
-            continue
-        try:
-            record = json.loads(raw_line)
-        except json.JSONDecodeError:
-            warnings.append("Malformed rga JSON record.")
-            continue
-        if record.get("type") != "match":
-            continue
-        data = record.get("data", {})
-        source = data.get("path", {}).get("text", "")
-        evidence = data.get("lines", {}).get("text", "").rstrip("\n")
-        line = data.get("line_number")
-        classification = classify_match(evidence, source)
-        if classification is None:
-            continue
-        category, severity, confidence = classification
-        findings.append(
-            Finding(
-                source=relative_source(target, Path(source)) if source else "<unknown>",
-                category=category,
-                severity=severity,
-                detector="rga",
-                evidence=evidence,
-                line=line,
-                confidence=confidence,
-                metadata={},
-            )
-        )
-    return findings, warnings
-
-
-def parse_trufflehog_output(payload: str, target: Path) -> tuple[list[Finding], list[str]]:
-    findings: list[Finding] = []
-    warnings: list[str] = []
-    for raw_line in payload.splitlines():
-        if not raw_line.strip():
-            continue
-        try:
-            record = json.loads(raw_line)
-        except json.JSONDecodeError:
-            warnings.append("Malformed trufflehog JSON record.")
-            continue
-        source = (
-            record.get("SourceMetadata", {})
-            .get("Data", {})
-            .get("Filesystem", {})
-            .get("file", "<unknown>")
-        )
-        detector = str(record.get("DetectorName", "trufflehog"))
-        raw_value = str(record.get("Raw", "")).strip()
-        severity = "critical" if record.get("Verified") else "high"
-        findings.append(
-            Finding(
-                source=relative_source(target, Path(source)) if source else "<unknown>",
-                category="credential",
-                severity=severity,
-                detector="trufflehog",
-                evidence=raw_value or detector,
-                line=None,
-                confidence=0.99 if record.get("Verified") else 0.85,
-                metadata={"detector_name": detector},
-            )
-        )
-    return findings, warnings
 
 
 def build_llm_recon_context(target: Path, findings: list[Finding], max_files: int) -> dict[str, object]:
@@ -1990,210 +1447,6 @@ def select_llm_findings(findings: list[Finding], max_files: int) -> list[Finding
         seen_sources.add(finding.source)
         selected.append(finding)
     return selected
-
-
-def render_report(
-    args: argparse.Namespace,
-    target: Path,
-    findings: list[Finding],
-    warnings: list[str],
-    llm_summary: dict[str, object] | None = None,
-    agent_run: AgentRun | None = None,
-) -> str:
-    generated_at = datetime.now(timezone.utc).isoformat()
-    high_value = [finding for finding in findings if severity_rank(finding.severity) >= severity_rank("high")]
-    secret_findings = [finding for finding in findings if finding.category in {"credential", "sensitive-file"}]
-    personal_financial = [finding for finding in findings if finding.category in {"personal-data", "financial-data"}]
-
-    lines = [
-        "# Sensitive Report",
-        "",
-        "This report may contain verbatim secrets and should be handled carefully.",
-        "",
-        "## Scope",
-        f"- Target: {target}",
-        f"- Generated: {generated_at}",
-        f"- Model: {args.model}",
-        f"- OCR Enabled: {'yes' if args.ocr else 'no'}",
-        "",
-        "## Coverage and Warnings",
-    ]
-    if warnings:
-        lines.extend(f"- {warning}" for warning in warnings)
-    else:
-        lines.append("- No scanner warnings.")
-
-    lines.extend(["", "## Executive Summary"])
-    if llm_summary and llm_summary.get("executive_summary"):
-        lines.append(f"- {llm_summary['executive_summary']}")
-    elif findings:
-        lines.append(f"- Found {len(findings)} findings across {len({finding.source for finding in findings})} files.")
-    else:
-        lines.append("- No high-signal findings detected by the deterministic scanner.")
-
-    lines.extend(["", "## Ranked High-Value Findings"])
-    lines.extend(render_findings(high_value or findings))
-
-    lines.extend(["", "## Secret and Credential Findings"])
-    lines.extend(render_findings(secret_findings))
-
-    lines.extend(["", "## Personal and Financial Data Findings"])
-    lines.extend(render_findings(personal_financial))
-
-    lines.extend(["", "## Interesting Documents and Relationships"])
-    if llm_summary and llm_summary.get("relationships"):
-        for relationship in llm_summary["relationships"]:
-            lines.extend(render_relationship(relationship))
-    elif findings:
-        lines.append("- Manual review should start with the highest-severity files listed below.")
-    else:
-        lines.append("- None.")
-
-    if llm_summary and llm_summary.get("priority_findings"):
-        lines.extend(["", "## LLM Priority Findings"])
-        for item in llm_summary["priority_findings"]:
-            rendered_item = render_priority_item(item)
-            if rendered_item:
-                lines.append(rendered_item)
-
-    lines.extend(["", "## Files Recommended for Manual Review"])
-    review_order = llm_summary.get("review_order") if llm_summary else None
-    if isinstance(review_order, list) and review_order and all(looks_like_source_path(source) for source in review_order):
-        for source in review_order:
-            lines.append(f"- {source}")
-    elif findings:
-        for source in sorted({finding.source for finding in findings}):
-            lines.append(f"- {source}")
-    else:
-        lines.append("- None.")
-
-    if agent_run is not None:
-        lines.extend(["", "## Agent Investigation Plan"])
-        if agent_run.hypotheses:
-            for hypothesis in agent_run.hypotheses:
-                lines.append(f"- [{hypothesis.status}] {hypothesis.label}: {hypothesis.rationale}")
-        else:
-            lines.append("- No agent hypotheses recorded.")
-        if agent_run.actions:
-            for action in agent_run.actions:
-                target_label = action.query or action.path
-                lines.append(f"  - action={action.kind} target={target_label} reason={action.reason}")
-
-        lines.extend(["", "## Agent Observations"])
-        if agent_run.observations:
-            for observation in agent_run.observations[:20]:
-                lines.append(
-                    f"- {observation.path} via {observation.source_mechanism} "
-                    f"(confidence={observation.confidence:.2f})"
-                )
-                if observation.derived_claim:
-                    lines.append(f"  Claim: {observation.derived_claim}")
-                lines.append(
-                    f"  Exit status: {observation.exit_status}  Truncated: {'yes' if observation.truncated else 'no'}"
-                )
-                helper_hash = observation.metadata.get("helper_source_hash")
-                if helper_hash:
-                    lines.append(f"  Helper source hash: {helper_hash}")
-                lines.append(f"  Evidence: `{observation.evidence}`")
-        else:
-            lines.append("- No agent observations recorded.")
-
-        rejected = [item for item in agent_run.hypotheses if item.status == "rejected"]
-        lines.extend(["", "## Rejected Hypotheses"])
-        if rejected:
-            for hypothesis in rejected:
-                lines.append(f"- {hypothesis.label}: {hypothesis.notes or hypothesis.rationale}")
-        else:
-            lines.append("- None.")
-
-        lines.extend(["", "## Agent Coverage and Limitations"])
-        lines.append(f"- Sandbox available: {'yes' if agent_run.sandbox_available else 'no'}")
-        if agent_run.generated_helpers_skipped:
-            lines.append("- Generated helpers were skipped.")
-        if agent_run.warnings:
-            lines.extend(f"- {warning}" for warning in agent_run.warnings)
-        else:
-            lines.append("- No agent warnings.")
-
-    lines.append("")
-    return "\n".join(lines)
-
-
-def render_relationship(item: object) -> list[str]:
-    if isinstance(item, dict):
-        relation_type = str(item.get("type") or item.get("relationship_type") or "relationship")
-        description = str(item.get("description") or item.get("inference") or "").strip()
-        sources = item.get("source_paths")
-        if not sources and item.get("source_path"):
-            sources = [item.get("source_path")]
-        if not description and not sources:
-            return []
-        lines = [f"- {relation_type}: {description}".rstrip()]
-        if isinstance(sources, list) and sources:
-            lines.append(f"  Sources: {', '.join(str(source) for source in sources)}")
-        return lines
-    return [f"- {item}"]
-
-
-def normalize_llm_summary(summary: dict[str, object]) -> dict[str, object]:
-    priority_findings = summary.get("priority_findings")
-    review_order = summary.get("review_order")
-    if not isinstance(priority_findings, list) or not isinstance(review_order, list):
-        return summary
-
-    normalized_items: list[object] = []
-    for index, item in enumerate(priority_findings):
-        if isinstance(item, dict) and not item.get("source") and not item.get("source_path"):
-            if index < len(review_order) and isinstance(review_order[index], str) and review_order[index].strip():
-                updated_item = dict(item)
-                updated_item["source_path"] = review_order[index]
-                normalized_items.append(updated_item)
-                continue
-        normalized_items.append(item)
-
-    normalized_summary = dict(summary)
-    normalized_summary["priority_findings"] = normalized_items
-    return normalized_summary
-
-
-def looks_like_source_path(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    candidate = value.strip()
-    if not candidate:
-        return False
-    if candidate[:1].isdigit() and ". " in candidate:
-        return False
-    return "/" in candidate or "." in Path(candidate).name
-
-
-def render_priority_item(item: object) -> str:
-    if isinstance(item, dict):
-        source = item.get("source") or item.get("source_path") or "<source missing>"
-        reason = (
-            item.get("why")
-            or item.get("description")
-            or item.get("claim")
-            or item.get("rationale")
-            or item.get("context")
-            or item.get("supporting_evidence")
-            or "<reason missing>"
-        )
-        if reason == "<reason missing>":
-            return ""
-        return f"- {source}: {reason}".rstrip()
-    return f"- {item}"
-
-
-def render_findings(findings: list[Finding]) -> list[str]:
-    if not findings:
-        return ["- None."]
-    lines: list[str] = []
-    for finding in findings:
-        location = f"{finding.source}:{finding.line}" if finding.line is not None else finding.source
-        lines.append(f"- [{finding.severity}] {finding.category} in {location} via {finding.detector}")
-        lines.append(f"  Evidence: `{finding.evidence}`")
-    return lines
 
 
 def run_scan(args: argparse.Namespace) -> int:
