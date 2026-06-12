@@ -205,6 +205,13 @@ def colorize(label: str, color: str) -> str:
     return f"{ANSI_COLORS[color]}{label}{ANSI_RESET}"
 
 
+def summarize_evidence(text: str, limit: int = 120) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
 def summarize_findings(findings: list[Finding], warnings: list[str]) -> list[str]:
     by_severity = {severity: 0 for severity in SEVERITY_ORDER}
     for finding in findings:
@@ -242,6 +249,7 @@ def summarize_findings(findings: list[Finding], warnings: list[str]) -> list[str
             lines.append(
                 f"    - {colorize(finding.severity, finding.severity)} {location} [{finding.category}] via {finding.detector}"
             )
+            lines.append(f"      Evidence: {summarize_evidence(finding.evidence)}")
     return lines
 
 

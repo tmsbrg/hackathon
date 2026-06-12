@@ -179,6 +179,7 @@ class ContractEdgeTests(unittest.TestCase):
         self.assertIn("Scan Summary", rendered)
         self.assertIn("\033[", rendered)
         self.assertIn("Top findings:", rendered)
+        self.assertIn("Evidence: password=secret", rendered)
 
 
 if __name__ == "__main__":
