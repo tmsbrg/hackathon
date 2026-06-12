@@ -80,6 +80,35 @@ class ScanLogicTests(unittest.TestCase):
             self.assertEqual(warnings, [])
             self.assertEqual(findings, [])
 
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_supports_all_documented_text_extensions(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            expected_sources = set()
+            for suffix in sorted(cli.TEXT_EXTENSIONS):
+                sample = target / f"sample{suffix}"
+                sample.write_text("password=secret\n", encoding="utf-8")
+                expected_sources.add(f"sample{suffix}")
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        found_sources = {finding.source for finding in findings}
+        self.assertTrue(expected_sources.issubset(found_sources))
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_supports_all_documented_sensitive_filenames(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            for name in sorted(cli.SENSITIVE_FILENAMES):
+                (target / name).write_text("placeholder\n", encoding="utf-8")
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        found_sources = {finding.source for finding in findings}
+        self.assertTrue(set(cli.SENSITIVE_FILENAMES).issubset(found_sources))
+
     def test_render_report_contains_expected_sections(self) -> None:
         args = cli.build_parser().parse_args(["scan", "/tmp/example", "--no-llm"])
         finding = cli.Finding(

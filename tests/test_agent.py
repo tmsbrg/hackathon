@@ -66,6 +66,22 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("docs/alpha.txt", representative)
         self.assertIn("docs/beta.json", representative)
 
+    def test_build_agent_recon_context_samples_documented_text_like_extensions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / "case.xml").write_text("<root>secret</root>\n", encoding="utf-8")
+            (target / "case.html").write_text("<html>secret</html>\n", encoding="utf-8")
+            (target / "case.tsv").write_text("user\tpassword\n", encoding="utf-8")
+            (target / "case.eml").write_text("From: a@example.com\n\nbody\n", encoding="utf-8")
+
+            recon = cli.build_agent_recon_context(target, [], max_files=10)
+
+        representative = {item["path"] for item in recon["representative_heads"]}
+        self.assertIn("case.xml", representative)
+        self.assertIn("case.html", representative)
+        self.assertIn("case.tsv", representative)
+        self.assertIn("case.eml", representative)
+
     def test_deduplicate_agent_actions_preserves_first_unique_action(self) -> None:
         actions = [
             cli.AgentAction(kind="read_head", path="a.txt", reason="first"),
@@ -188,6 +204,62 @@ class AgentModeTests(unittest.TestCase):
 
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].metadata["timeout_seconds"], "7")
+
+    def test_parse_agent_actions_rejects_sentence_as_file_target(self) -> None:
+        actions = cli.parse_agent_actions(
+            [
+                {
+                    "kind": "read_head",
+                    "path": "The content contains cookie-related information which may be relevant to finding the flag.",
+                    "reason": "Inspect a representative file from the dataset profile.",
+                }
+            ]
+        )
+
+        self.assertEqual(actions, [])
+
+    def test_parse_agent_actions_normalizes_zip_list_directory_target(self) -> None:
+        actions = cli.parse_agent_actions(
+            [{"kind": "zip_list", "path": "ctf_cases/bad_blockchain", "reason": "inspect archive-like target"}]
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "dir_list")
+
+    def test_classify_agent_target_supports_documented_helper_extensions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            samples = {
+                "mail.eml": "email",
+                "archive.zip": "archive",
+                "scan.png": "image",
+                "scan.jpg": "image",
+                "scan.jpeg": "image",
+                "scan.tif": "image",
+                "scan.tiff": "image",
+                "scan.bmp": "image",
+                "report.pdf": "pdf",
+            }
+            for name in samples:
+                (target / name).write_bytes(b"x")
+
+            for name, expected in samples.items():
+                with self.subTest(name=name):
+                    self.assertEqual(cli.classify_agent_target(target / name), expected)
+
+    def test_parse_agent_actions_strips_trailing_query_fields_from_path(self) -> None:
+        actions = cli.parse_agent_actions(
+            [
+                {
+                    "kind": "read_head",
+                    "path": '/tmp/case/file.txt,query="",limit=200',
+                    "reason": "inspect file",
+                }
+            ]
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].path, "/tmp/case/file.txt")
 
     def test_salvage_agent_plan_matches_basename_stem_and_keyword(self) -> None:
         hypotheses, actions = cli.salvage_agent_plan_from_text(
@@ -947,6 +1019,86 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(len(summarized), 1)
         self.assertEqual(summarized[0]["path"], "docs/a.txt")
         self.assertLessEqual(len(summarized[0]["evidence"]), 80)
+
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_review_false_positives_drops_explicit_model_decisions(self, urlopen: mock.Mock) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        response.read.return_value = json.dumps(
+            {
+                "response": "drop|1|License boilerplate\nkeep|0|Actual secret evidence\n"
+            }
+        ).encode("utf-8")
+        urlopen.return_value = response
+
+        findings = [
+            cli.Finding(
+                source="docs/a.txt",
+                category="credential",
+                severity="high",
+                detector="rga",
+                evidence="password=secret",
+                line=1,
+                confidence=0.9,
+                metadata={},
+            ),
+            cli.Finding(
+                source="LICENSE.txt",
+                category="credential",
+                severity="high",
+                detector="rga",
+                evidence="password example",
+                line=1,
+                confidence=0.4,
+                metadata={},
+            ),
+        ]
+
+        kept, removed = cli.review_false_positives(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            findings,
+            model_retries=0,
+        )
+
+        self.assertEqual([finding.source for finding in kept], ["docs/a.txt"])
+        self.assertEqual([finding.source for finding in removed], ["LICENSE.txt"])
+
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_review_false_positives_ignores_contradictory_drop_reason(self, urlopen: mock.Mock) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        response.read.return_value = json.dumps(
+            {
+                "response": "drop|0|credential - keep for now.\n"
+            }
+        ).encode("utf-8")
+        urlopen.return_value = response
+
+        findings = [
+            cli.Finding(
+                source="docs/a.txt",
+                category="credential",
+                severity="high",
+                detector="rga",
+                evidence="password=secret",
+                line=1,
+                confidence=0.9,
+                metadata={},
+            ),
+        ]
+
+        kept, removed = cli.review_false_positives(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            findings,
+            model_retries=0,
+        )
+
+        self.assertEqual([finding.source for finding in kept], ["docs/a.txt"])
+        self.assertEqual(removed, [])
 
     def test_parse_generated_helper_output_warns_on_record_truncation(self) -> None:
         payload = "\n".join(

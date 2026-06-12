@@ -79,5 +79,7 @@ class AgentRun:
     observations: list[AgentObservation] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     llm_summary: dict[str, object] | None = None
+    reviewed_findings: list[Finding] = field(default_factory=list)
+    removed_findings: list[Finding] = field(default_factory=list)
     sandbox_available: bool = False
     generated_helpers_skipped: bool = False
