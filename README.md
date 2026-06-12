@@ -1,6 +1,6 @@
 # doc-triage
 
-`doc-triage` is a dependency-light local triage CLI for scanning an authorized directory or mounted share for high-value findings. It combines deterministic scanners (`rg`, `rga`, TruffleHog, optional OCR) with an optional local Ollama-backed agent loop, then writes one self-contained Markdown report.
+`doc-triage` is a dependency-light local triage CLI for scanning an authorized directory or mounted share for high-value findings. It combines deterministic scanners (`rg`, `rga`, TruffleHog, optional OCR) with optional Ollama-backed analysis modes, then writes one self-contained Markdown report.
 
 The report may contain verbatim secrets. Treat it like sensitive evidence.
 
@@ -16,7 +16,9 @@ The report may contain verbatim secrets. Treat it like sensitive evidence.
 
 - Deterministic scanning for credentials, flags, personal data, and sensitive filenames
 - Optional OCR for images and PDFs
-- Optional agent mode that profiles the dataset, proposes read-only follow-up actions, executes them, and summarizes results
+- Deterministic-only default scan mode
+- Optional single-agent plan/do/check/act mode
+- Optional multi-agent subagent mode with role-specific hypothesis testing
 - Restrictive report permissions (`0600`)
 - Verbose terminal progress, including raw planner/refinement output in `--verbose` mode
 
@@ -45,6 +47,7 @@ doc-triage scan TARGET
   [--max-llm-files N]
   [--exclude GLOB]
   [--no-llm]
+  [--no-dedup]
   [--agent]
   [--multi-agent]
   [--agent-max-actions N]
@@ -77,6 +80,12 @@ Run a deterministic scan:
 doc-triage scan /path/to/share --output report.md
 ```
 
+Keep overlapping hits from multiple mechanisms:
+
+```bash
+doc-triage scan /path/to/share --output report.md --no-dedup
+```
+
 Run with OCR:
 
 ```bash
@@ -105,6 +114,28 @@ Exclude noisy paths:
 ```bash
 doc-triage scan /path/to/share --output report.md --exclude '*.zip' --exclude 'tmp/*'
 ```
+
+## Scan modes
+
+- No mode flag:
+  deterministic scan only
+- `--agent`:
+  one local LLM-driven plan/do/check/act loop
+- `--multi-agent`:
+  full subagent pipeline with role planning, handoffs, and coordinator review
+
+`--agent` and `--multi-agent` both require LLM mode and are mutually exclusive.
+
+## Deduplication
+
+By default, `doc-triage` deduplicates repeated findings from the same file when multiple mechanisms surface the same underlying sensitive value. This is meant to collapse cases like:
+
+- `password=Welkom123`
+- `Welkom123`
+
+from separate detectors into one result.
+
+Use `--no-dedup` when you want raw overlapping hits preserved for review.
 
 ## External tools
 
@@ -298,8 +329,8 @@ Normal mode prints a concise colorized summary.
 `--verbose` additionally prints:
 
 - scan stage progress
-- raw agent planner output
-- raw agent refinement output
+- raw single-agent or multi-agent planner output
+- raw multi-agent refinement output
 - LLM/agent warnings as they happen
 
 Deterministic findings use specific detector labels where possible, for example:
