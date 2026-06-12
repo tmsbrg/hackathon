@@ -10,6 +10,7 @@ from .constants import (
     DOC_NOISE_FILENAMES,
     NOISE_PHRASES,
     SEVERITY_ORDER,
+    SIGNAL_PATTERN_LABELS,
     SIGNAL_PATTERNS,
     SENSITIVE_FILENAMES,
 )
@@ -79,6 +80,27 @@ def classify_match(text: str, source: str = "") -> tuple[str, str, float] | None
     return None
 
 
+def classify_match_with_detector(text: str, source: str = "") -> tuple[str, str, float, str] | None:
+    if is_noise_evidence(text):
+        return None
+
+    stripped = text.strip()
+    lowered = stripped.lower()
+    source_name = Path(source).name.lower() if source else ""
+
+    for index, (pattern, rule) in enumerate(SIGNAL_PATTERNS):
+        if pattern.search(stripped):
+            return (*rule, SIGNAL_PATTERN_LABELS[index])
+
+    if stripped.startswith(("http://", "https://")):
+        return None
+    if source_name in DOC_NOISE_FILENAMES:
+        return None
+    if any(phrase in lowered for phrase in NOISE_PHRASES):
+        return None
+    return None
+
+
 def relative_source(target: Path, file_path: Path) -> str:
     try:
         return str(file_path.relative_to(target))
@@ -110,15 +132,15 @@ def extract_digit_runs(text: str) -> list[str]:
 def keyword_findings(target: Path, file_path: Path, content: str) -> list[Finding]:
     findings: list[Finding] = []
     for line_number, line in enumerate(content.splitlines(), start=1):
-        classification = classify_match(line, relative_source(target, file_path))
+        classification = classify_match_with_detector(line, relative_source(target, file_path))
         if classification is not None:
-            category, severity, confidence = classification
+            category, severity, confidence, detector = classification
             findings.append(
                 Finding(
                     source=relative_source(target, file_path),
                     category=category,
                     severity=severity,
-                    detector="built-in",
+                    detector=detector,
                     evidence=line,
                     line=line_number,
                     confidence=confidence,

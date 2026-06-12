@@ -277,6 +277,21 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(actions[0].query, "IP address")
         self.assertEqual(actions[0].reason, "The bad blockchain case specifically mentions finding an IP address in the Bitcoin transaction data.")
 
+    def test_parse_agent_plan_lines_accepts_investigate_file_alias(self) -> None:
+        payload = (
+            "investigate_file|ctf_cases/bad_blockchain/ctf/bad-blockchain.txt|"
+            "Investigate bad-blockchain.txt for IP address extraction.|"
+            "The file contains Bitcoin addresses and transaction IDs related to a botnet's command-and-control server storage method.|"
+            "1000|10\n"
+        )
+
+        hypotheses, actions = cli.parse_agent_plan_lines(payload)
+
+        self.assertEqual(hypotheses, [])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "read_head")
+        self.assertEqual(actions[0].path, "ctf_cases/bad_blockchain/ctf/bad-blockchain.txt")
+
     def test_parse_agent_plan_lines_accepts_hypothesis_action_hybrid_shape(self) -> None:
         payload = (
             "hypothesis|label|The bad blockchain case requires extracting an IP address from Bitcoin transaction data.|"
@@ -557,6 +572,33 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(len(hypotheses), 1)
         self.assertEqual(len(actions), 1)
+
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_plan_verbose_logs_raw_output(self, urlopen: mock.Mock) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        response.read.return_value = json.dumps(
+            {
+                "response": "action|kind=dir_list|target_or_query=docs|reason=Inspect docs.|limit=5|timeout_seconds=5"
+            }
+        ).encode("utf-8")
+        urlopen.return_value = response
+
+        stdout = StringIO()
+        with contextlib.redirect_stdout(stdout):
+            hypotheses, actions = cli.request_agent_plan(
+                "http://127.0.0.1:11434",
+                "qwen3:8b",
+                {"instructions": ["Return hypotheses and actions"]},
+                verbose=True,
+                stage_label="agent-plan-test",
+            )
+
+        self.assertEqual(hypotheses, [])
+        self.assertEqual(len(actions), 1)
+        self.assertIn("[agent-plan-test attempt 1] model output follows:", stdout.getvalue())
+        self.assertIn("action|kind=dir_list", stdout.getvalue())
 
     @mock.patch("doc_triage.cli.urlopen")
     def test_request_agent_plan_accepts_loose_schema_without_repair(self, urlopen: mock.Mock) -> None:

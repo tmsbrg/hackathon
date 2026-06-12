@@ -75,6 +75,7 @@ class IntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].category, "challenge-flag")
+        self.assertEqual(findings[0].detector, "pattern:flag-artifact")
         self.assertIn("flag{language}", findings[0].evidence)
 
     def test_parse_trufflehog_output_tolerates_invalid_json(self) -> None:

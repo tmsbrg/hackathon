@@ -93,6 +93,18 @@ from .runtime import (
 )
 
 
+def emit_verbose_llm_output(verbose: bool, stage: str, content: str, max_chars: int = 4000) -> None:
+    if not verbose:
+        return
+    compact = content.strip()
+    if not compact:
+        verbose_log(True, f"[{stage}] <empty response>")
+        return
+    if len(compact) > max_chars:
+        compact = compact[:max_chars] + "\n...<truncated>"
+    verbose_log(True, f"[{stage}] model output follows:\n{compact}")
+
+
 def ollama_health(ollama_url: str = "http://127.0.0.1:11434") -> tuple[bool, str]:
     request = Request(f"{ollama_url.rstrip('/')}/api/tags", method="GET")
     try:
@@ -737,6 +749,8 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
         for kind in AGENT_ACTION_KINDS:
             if lowered == kind or lowered.startswith(f"{kind}_"):
                 return kind
+        if lowered in {"investigate_file", "inspect_file", "review_file"}:
+            return "read_head"
         if lowered.startswith("dir_") or lowered.startswith("scan_dir"):
             return "dir_list"
         if path.endswith(".zip"):
@@ -932,6 +946,24 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
                         ]
                     )
                 )
+            continue
+        record_kind = _derive_kind(record_type, parts[1] if len(parts) >= 2 else "")
+        if record_kind and record_type not in AGENT_ACTION_KINDS and len(parts) >= 5:
+            limit = _parse_numeric(parts[4], "", 20)
+            timeout_seconds = _parse_numeric(parts[5], "", 0) if len(parts) >= 6 else 0
+            actions.extend(
+                parse_agent_actions(
+                    [
+                        {
+                            "kind": record_kind,
+                            "path": parts[1],
+                            "reason": parts[2] if len(parts) >= 3 else f"Investigate {parts[1]} via {record_kind}.",
+                            "limit": limit,
+                            "timeout_seconds": timeout_seconds,
+                        }
+                    ]
+                )
+            )
             continue
         positional_kind = _derive_kind(parts[1], parts[3] if len(parts) >= 4 else "") if len(parts) >= 2 else ""
         if positional_kind and len(parts) >= 6:
@@ -1966,6 +1998,8 @@ def request_agent_plan(
     model: str,
     prompt: dict[str, object],
     model_retries: int = 1,
+    verbose: bool = False,
+    stage_label: str = "agent-plan",
 ) -> tuple[list[AgentHypothesis], list[AgentAction]]:
     last_error: Exception | None = None
     previous_response = ""
@@ -1996,6 +2030,7 @@ def request_agent_plan(
                 },
             )
             previous_response = response_text
+            emit_verbose_llm_output(verbose, f"{stage_label} attempt {attempt + 1}", response_text)
             hypotheses, actions = parse_agent_plan_lines(response_text)
             if actions:
                 return hypotheses, [action for action in actions if action.kind in AGENT_ACTION_KINDS]
@@ -2105,6 +2140,8 @@ def run_agent_mode(
             args.model,
             build_agent_plan_prompt(target, recon, findings[: args.max_llm_files], args.agent_max_actions),
             model_retries=args.model_retries,
+            verbose=args.verbose,
+            stage_label="agent-plan-initial",
         )
     except Exception as exc:
         warnings.append(f"agent planning failed: {exc}")
@@ -2149,6 +2186,8 @@ def run_agent_mode(
                 max(0, args.agent_max_actions - len(actions)),
             ),
             model_retries=args.model_retries,
+            verbose=args.verbose,
+            stage_label="agent-plan-refine",
         )
     except Exception as exc:
         refined_hypotheses, refined_actions = hypotheses, []

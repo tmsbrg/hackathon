@@ -44,6 +44,21 @@ SIGNAL_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, str, float]], ...] = (
     (re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"), ("sensitive-file", "critical", 0.99)),
     (re.compile(r"\bopenssh private key\b", re.IGNORECASE), ("sensitive-file", "critical", 0.98)),
 )
+SIGNAL_PATTERN_LABELS = (
+    "pattern:flag-artifact",
+    "pattern:password-assignment",
+    "pattern:passwd-assignment",
+    "pattern:secret-assignment",
+    "pattern:aws-secret-access-key",
+    "pattern:token-assignment",
+    "pattern:api-key",
+    "pattern:bearer-token",
+    "pattern:set-cookie-httponly",
+    "pattern:iban-keyword",
+    "pattern:bsn-keyword",
+    "pattern:private-key-block",
+    "pattern:openssh-private-key",
+)
 DOC_NOISE_FILENAMES = {
     "license",
     "license.txt",
