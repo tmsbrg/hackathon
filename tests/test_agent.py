@@ -444,6 +444,45 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual([item.role for item in ordered], ["credential_hunter", "identity_reviewer"])
 
     @mock.patch("doc_triage.cli.request_agent_coordination")
+    def test_request_role_hypothesis_reviews_scopes_calls_by_role(self, request_agent_coordination: mock.Mock) -> None:
+        request_agent_coordination.side_effect = [
+            [cli.AgentHypothesis(label="vpn lead", rationale="token clue", status="confirmed", role="credential_hunter")],
+            [cli.AgentHypothesis(label="finance lead", rationale="payroll clue", status="inconclusive", role="identity_reviewer")],
+        ]
+        args = cli.build_parser().parse_args(["scan", "/tmp/case", "--agent"])
+        hypotheses = [
+            cli.AgentHypothesis(label="vpn lead", rationale="token clue", role="credential_hunter"),
+            cli.AgentHypothesis(label="finance lead", rationale="payroll clue", role="identity_reviewer"),
+        ]
+        actions = [
+            cli.AgentAction(kind="content_search", query="vpn", reason="inspect vpn trail", role="credential_hunter"),
+            cli.AgentAction(kind="dir_list", path="Finance", reason="inspect payroll area", role="identity_reviewer"),
+        ]
+        observations = [
+            cli.AgentObservation(path="vpn.txt", evidence="vpn token reset", source_mechanism="content_search", confidence=0.9, role="credential_hunter"),
+            cli.AgentObservation(path="Finance/payroll.xlsx", evidence="salary bands", source_mechanism="file_info", confidence=0.7, role="identity_reviewer"),
+        ]
+
+        updates, warnings = cli.request_role_hypothesis_reviews(
+            Path("/tmp/case"),
+            {"representative_heads": []},
+            hypotheses,
+            actions,
+            observations,
+            args,
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(request_agent_coordination.call_count, 2)
+        first_prompt = request_agent_coordination.call_args_list[0].args[2]
+        second_prompt = request_agent_coordination.call_args_list[1].args[2]
+        self.assertEqual(first_prompt["assigned_role"], "credential_hunter")
+        self.assertEqual(second_prompt["assigned_role"], "identity_reviewer")
+        self.assertEqual(first_prompt["hypotheses"][0]["role"], "credential_hunter")
+        self.assertEqual(second_prompt["hypotheses"][0]["role"], "identity_reviewer")
+
+    @mock.patch("doc_triage.cli.request_agent_coordination")
     def test_run_agent_mode_applies_coordinator_updates(self, request_agent_coordination: mock.Mock) -> None:
         request_agent_coordination.return_value = [
             cli.AgentHypothesis(
@@ -1824,6 +1863,63 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("Executing verification subagent credential_hunter actions", rendered)
         self.assertTrue(any(action.kind == "content_search" and action.query == "vpn" for action in run.actions))
         self.assertTrue(any(observation.role == "credential_hunter" for observation in run.observations))
+
+    @mock.patch("doc_triage.cli.request_agent_summary", return_value={"executive_summary": "done", "priority_findings": [], "relationships": [], "review_order": []})
+    @mock.patch("doc_triage.cli.request_agent_coordination")
+    @mock.patch("doc_triage.cli.request_agent_plan")
+    @mock.patch("doc_triage.cli.execute_agent_actions")
+    def test_run_agent_mode_applies_role_review_before_global_coordination(
+        self,
+        execute_agent_actions: mock.Mock,
+        request_agent_plan: mock.Mock,
+        request_agent_coordination: mock.Mock,
+        _: mock.Mock,
+    ) -> None:
+        request_agent_plan.side_effect = [
+            (
+                [cli.AgentHypothesis(label="vpn lead", rationale="token clue", role="credential_hunter")],
+                [cli.AgentAction(kind="content_search", query="vpn", reason="inspect vpn trail", role="credential_hunter")],
+            ),
+            (
+                [],
+                [],
+            ),
+        ]
+        request_agent_coordination.side_effect = [
+            [cli.AgentHypothesis(label="vpn lead", rationale="role review confirmed token clue", status="confirmed", role="credential_hunter")],
+            [],
+        ]
+        execute_agent_actions.side_effect = [
+            (
+                [],
+                [],
+            ),
+            (
+                [
+                    cli.AgentObservation(
+                        path="vpn.txt",
+                        evidence="vpn token reset instructions",
+                        source_mechanism="content_search",
+                        confidence=0.9,
+                        role="credential_hunter",
+                        derived_claim="Confirmed VPN token material",
+                    )
+                ],
+                [],
+            ),
+        ]
+        args = cli.build_parser().parse_args(["--verbose", "scan", "/tmp/case", "--agent"])
+        stdout = StringIO()
+        with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stdout(stdout):
+            target = Path(tmpdir)
+            (target / "vpn.txt").write_text("vpn token reset instructions\n", encoding="utf-8")
+            run = cli.run_agent_mode(target, [], args)
+
+        rendered = stdout.getvalue()
+        self.assertIn("Requesting subagent verdict review for credential_hunter", rendered)
+        self.assertEqual(request_agent_coordination.call_count, 2)
+        self.assertEqual(request_agent_coordination.call_args_list[0].args[2]["assigned_role"], "credential_hunter")
+        self.assertTrue(any(hypothesis.label == "vpn lead" and hypothesis.status == "confirmed" for hypothesis in run.hypotheses))
 
 
 if __name__ == "__main__":
