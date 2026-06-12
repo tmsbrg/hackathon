@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import html
 import json
 import re
 from pathlib import Path
@@ -131,10 +132,18 @@ def extract_digit_runs(text: str) -> list[str]:
 
 def keyword_findings(target: Path, file_path: Path, content: str) -> list[Finding]:
     findings: list[Finding] = []
+    invalid_bsn_context = False
     for line_number, line in enumerate(content.splitlines(), start=1):
+        lowered_line = line.lower()
+        if any(marker in lowered_line for marker in ("invalid bsn", "bsn for testing", "test user sandbox", "sandbox")):
+            invalid_bsn_context = True
         classification = classify_match_with_detector(line, relative_source(target, file_path))
         if classification is not None:
             category, severity, confidence, detector = classification
+            if detector == "pattern:bsn-keyword" and any(
+                marker in lowered_line for marker in ("invalid", "testing", "sandbox", "sample", "dummy", "fake")
+            ):
+                continue
             findings.append(
                 Finding(
                     source=relative_source(target, file_path),
@@ -162,6 +171,11 @@ def keyword_findings(target: Path, file_path: Path, content: str) -> list[Findin
                     )
                 )
             elif len(candidate) == 9:
+                if invalid_bsn_context or any(
+                    marker in lowered_line
+                    for marker in ("invalid", "testing", "sandbox", "sample", "dummy", "fake", "test user")
+                ):
+                    continue
                 findings.append(
                     Finding(
                         source=relative_source(target, file_path),

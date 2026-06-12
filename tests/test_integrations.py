@@ -3,11 +3,170 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+import tarfile
+import gzip
+import bz2
+import lzma
+import zipfile
 
 from doc_triage import cli
 
 
 class IntegrationTests(unittest.TestCase):
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_extracts_findings_from_docx_and_xlsx(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            docx_path = target / "vpn.docx"
+            with zipfile.ZipFile(docx_path, "w") as archive:
+                archive.writestr("word/document.xml", "<w:t>password=VeloCity-VPN-9kLm2!</w:t>")
+            xlsx_path = target / "payroll.xlsx"
+            with zipfile.ZipFile(xlsx_path, "w") as archive:
+                archive.writestr("xl/worksheets/sheet2.xml", "<v>fin_api_NwQ3_8842secret</v>")
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        sources = {finding.source for finding in findings}
+        self.assertIn("vpn.docx::word/document.xml", sources)
+        self.assertIn("payroll.xlsx::xl/worksheets/sheet2.xml", sources)
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_extracts_findings_from_eml(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            mail = target / "reset.eml"
+            mail.write_text(
+                "From: helpdesk@example.com\n"
+                "To: user@example.com\n"
+                "Subject: reset\n"
+                "\n"
+                "Tijdelijk_wachtwoord: PortalReset-2024-xK9\n",
+                encoding="utf-8",
+            )
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        self.assertTrue(any("PortalReset-2024-xK9" in finding.evidence for finding in findings))
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    def test_scan_target_extracts_findings_from_zip_and_nested_7z(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            archive_path = target / "backup.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("restore_notes.txt", "password=PgProd_Nordwind_7xK!mQ\n")
+                archive.writestr("configs.7z", b"placeholder")
+
+            def run_command_side_effect(command: list[str], **_: object) -> cli.CommandResult:
+                if command[0] == "/usr/bin/7z":
+                    output_arg = next(arg for arg in command if arg.startswith("-o"))
+                    extract_root = Path(output_arg[2:])
+                    (extract_root / "oracle_legacy.txt").write_text("password=OrclNw2019!sys\n", encoding="utf-8")
+                    return cli.CommandResult(exit_code=0, stdout="", stderr="", timed_out=False)
+                raise AssertionError(f"Unexpected command: {command}")
+
+            with mock.patch("doc_triage.cli.shutil.which", side_effect=lambda name: "/usr/bin/7z" if name == "7z" else None):
+                with mock.patch("doc_triage.cli.run_command", side_effect=run_command_side_effect):
+                    findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        sources = {finding.source for finding in findings}
+        self.assertIn("backup.zip::restore_notes.txt", sources)
+        self.assertIn("backup.zip::configs.7z::oracle_legacy.txt", sources)
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    @mock.patch("doc_triage.cli.collect_pdf_text", return_value=("FLAG{smb_ripgrep_trufflehog_master}\n", None))
+    def test_scan_target_extracts_findings_from_pdf_text(self, _: mock.Mock, __: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            pdf = target / "board_minutes.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n")
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        self.assertTrue(any(finding.category == "challenge-flag" for finding in findings))
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    @mock.patch("doc_triage.cli.collect_exif_text", return_value=("User Comment : BONUS{exif_metadata_dig}", None))
+    def test_scan_target_extracts_findings_from_image_metadata(self, _: mock.Mock, __: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            photo = target / "office_party.jpg"
+            photo.write_bytes(b"\xff\xd8\xff")
+
+            findings, warnings = cli.scan_target(target, max_files=None)
+
+        self.assertEqual(warnings, [])
+        self.assertTrue(any("BONUS{exif_metadata_dig}" in finding.evidence for finding in findings))
+
+    def test_list_archive_contents_supports_stdlib_archive_extensions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            zip_path = root / "sample.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("inner.txt", "secret\n")
+
+            tar_path = root / "sample.tar"
+            member = root / "inner.txt"
+            member.write_text("secret\n", encoding="utf-8")
+            with tarfile.open(tar_path, "w") as archive:
+                archive.add(member, arcname="inner.txt")
+
+            tgz_path = root / "sample.tgz"
+            with tarfile.open(tgz_path, "w:gz") as archive:
+                archive.add(member, arcname="inner.txt")
+
+            gz_path = root / "single.txt.gz"
+            with gzip.open(gz_path, "wb") as handle:
+                handle.write(b"secret\n")
+
+            bz2_path = root / "single.txt.bz2"
+            with bz2.open(bz2_path, "wb") as handle:
+                handle.write(b"secret\n")
+
+            xz_path = root / "single.txt.xz"
+            with lzma.open(xz_path, "wb") as handle:
+                handle.write(b"secret\n")
+
+            for archive_path, expected in (
+                (zip_path, "inner.txt"),
+                (tar_path, "inner.txt"),
+                (tgz_path, "inner.txt"),
+                (gz_path, "single.txt"),
+                (bz2_path, "single.txt"),
+                (xz_path, "single.txt"),
+            ):
+                with self.subTest(path=archive_path.name):
+                    result = cli.list_archive_contents(archive_path)
+                    self.assertEqual(result.exit_code, 0)
+                    self.assertIn(expected, result.stdout)
+
+    @mock.patch("doc_triage.cli.run_command")
+    @mock.patch("doc_triage.cli.shutil.which")
+    def test_list_archive_contents_uses_external_tools_for_7z_and_rar(self, which: mock.Mock, run_command: mock.Mock) -> None:
+        def which_side_effect(name: str) -> str | None:
+            if name == "7z":
+                return "/usr/bin/7z"
+            return None
+
+        which.side_effect = which_side_effect
+        run_command.return_value = cli.CommandResult(exit_code=0, stdout="file1\nfile2\n", stderr="", timed_out=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for suffix in (".7z", ".rar"):
+                archive_path = root / f"sample{suffix}"
+                archive_path.write_bytes(b"fake")
+                result = cli.list_archive_contents(archive_path)
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(result.stdout, "file1\nfile2\n")
+
+        self.assertTrue(all(call.args[0][0] == "7z" for call in run_command.call_args_list))
+
     def test_parse_rga_json_produces_findings(self) -> None:
         payload = "\n".join(
             [

@@ -18,6 +18,16 @@ class ScanLogicTests(unittest.TestCase):
 
         self.assertEqual(values, ["123456782"])
 
+    def test_keyword_findings_suppresses_invalid_bsn_testing_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            path = target / "records.json"
+            path.write_text('{"note":"SANDBOX - invalid BSN for testing","bsn":"999999999"}\n', encoding="utf-8")
+
+            findings = cli.keyword_findings(target, path, path.read_text(encoding="utf-8"))
+
+        self.assertEqual(findings, [])
+
     def test_classify_match_detects_http_only_cookie(self) -> None:
         classification = cli.classify_match(
             '"set-cookie" : "__cfduid=abc; expires=Mon, 27-Jun-16 15:56:37 GMT; path=/; domain=.example.com; HttpOnly",'

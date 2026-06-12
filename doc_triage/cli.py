@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import argparse
 import ast
+import bz2
 import errno
+import gzip
 import hashlib
+import io
 import json
+import lzma
 import mimetypes
 import re
 import shutil
 import sys
+import tarfile
 import tempfile
+import zipfile
 from collections import Counter
 from dataclasses import asdict
 from email import policy
@@ -473,14 +479,9 @@ def scan_target(
         if sensitive is not None:
             findings.append(sensitive)
 
-        if file_path.suffix.lower() not in TEXT_EXTENSIONS and file_path.name.lower() not in SENSITIVE_FILENAMES:
-            continue
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="ignore")
-        except OSError as exc:
-            warnings.append(f"Could not read {file_path}: {exc}")
-            continue
-        findings.extend(keyword_findings(target, file_path, content))
+        file_findings, file_warnings = collect_deterministic_file_findings(target, file_path)
+        findings.extend(file_findings)
+        warnings.extend(file_warnings)
 
     if ocr:
         progress_log(verbose, "ocr", "OCR enabled; processing supported image and PDF files")
@@ -494,6 +495,270 @@ def scan_target(
         progress_log(verbose, "ocr", f"OCR produced {len(ocr_findings)} findings and {len(ocr_warnings)} warnings")
 
     return deduplicate_findings(findings), warnings
+
+
+def findings_from_text(
+    target: Path,
+    file_path: Path,
+    content: str,
+    *,
+    source_override: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> list[Finding]:
+    findings = keyword_findings(target, file_path, content)
+    if source_override is None and not metadata:
+        return findings
+    for finding in findings:
+        if source_override is not None:
+            finding.source = source_override
+        if metadata:
+            finding.metadata.update(metadata)
+    return findings
+
+
+def decode_bytes(data: bytes) -> str:
+    for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="ignore")
+
+
+def is_textual_member_name(name: str) -> bool:
+    lowered = name.lower()
+    if lowered.endswith(("/", "\\")):
+        return False
+    suffix = Path(lowered).suffix
+    return suffix in TEXT_EXTENSIONS | {".xml", ".html", ".eml", ".csv", ".tsv"}
+
+
+def parse_email_text(payload: bytes) -> str:
+    message = BytesParser(policy=policy.default).parsebytes(payload)
+    parts: list[str] = []
+    for key in ("From", "To", "Subject", "Date", "Message-ID"):
+        value = message.get(key)
+        if value:
+            parts.append(f"{key}: {value}")
+    attachments = [part.get_filename() for part in message.iter_attachments() if part.get_filename()]
+    if attachments:
+        parts.append("Attachments: " + ", ".join(attachments))
+    body = ""
+    if message.is_multipart():
+        for part in message.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if part.get_content_disposition() == "attachment":
+                continue
+            try:
+                content = part.get_content()
+            except Exception:
+                continue
+            if isinstance(content, str) and content.strip():
+                body = content
+                break
+    else:
+        try:
+            content = message.get_content()
+            if isinstance(content, str):
+                body = content
+        except Exception:
+            body = ""
+    if body.strip():
+        parts.append(body)
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def collect_pdf_text(file_path: Path) -> tuple[str | None, str | None]:
+    pdftotext_path = shutil.which("pdftotext")
+    if pdftotext_path is None:
+        return None, None
+    with tempfile.TemporaryDirectory(prefix="doc-triage-pdf-") as temp_dir:
+        text_path = Path(temp_dir) / f"{file_path.stem}.txt"
+        result = run_command([pdftotext_path, str(file_path), str(text_path)], timeout=60, max_output_chars=4000)
+        if result.exit_code != 0 or not text_path.exists():
+            return None, f"PDF text extraction failed for {file_path.name}."
+        return text_path.read_text(encoding="utf-8", errors="ignore"), None
+
+
+def collect_exif_text(file_path: Path) -> tuple[str | None, str | None]:
+    exiftool_path = shutil.which("exiftool")
+    if exiftool_path is None:
+        return None, None
+    result = run_command([exiftool_path, str(file_path)], timeout=20, max_output_chars=4000)
+    if result.exit_code != 0:
+        return None, None
+    return result.stdout.strip(), None
+
+
+def collect_openxml_texts(file_path: Path, source_label: str) -> tuple[list[tuple[str, str]], list[str]]:
+    texts: list[tuple[str, str]] = []
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            for name in archive.namelist():
+                lowered = name.lower()
+                if not lowered.endswith(".xml"):
+                    continue
+                if not any(
+                    lowered.startswith(prefix)
+                    for prefix in ("word/", "xl/", "ppt/", "docprops/", "_rels/")
+                ):
+                    continue
+                try:
+                    content = decode_bytes(archive.read(name))
+                except KeyError:
+                    continue
+                texts.append((f"{source_label}::{name}", content))
+    except (OSError, zipfile.BadZipFile) as exc:
+        return [], [f"Could not read {file_path.name}: {exc}"]
+    return texts, []
+
+
+def collect_archive_texts(
+    archive_path: Path,
+    source_label: str,
+    *,
+    depth: int = 0,
+    max_depth: int = 2,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    if depth > max_depth:
+        return [], []
+    texts: list[tuple[str, str]] = []
+    warnings: list[str] = []
+    suffix = archive_path.suffix.lower()
+
+    if suffix == ".zip":
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                for name in archive.namelist():
+                    if name.endswith("/"):
+                        continue
+                    member_source = f"{source_label}::{name}"
+                    member_suffix = Path(name).suffix.lower()
+                    data = archive.read(name)
+                    if is_textual_member_name(name):
+                        texts.append((member_source, decode_bytes(data)))
+                        continue
+                    if member_suffix in {".docx", ".xlsx", ".pptx"}:
+                        with tempfile.TemporaryDirectory(prefix="doc-triage-archive-openxml-") as temp_dir:
+                            temp_path = Path(temp_dir) / Path(name).name
+                            temp_path.write_bytes(data)
+                            nested_texts, nested_warnings = collect_openxml_texts(temp_path, member_source)
+                            texts.extend(nested_texts)
+                            warnings.extend(nested_warnings)
+                        continue
+                    if member_suffix in {".zip", ".7z"} and depth < max_depth:
+                        with tempfile.TemporaryDirectory(prefix="doc-triage-archive-nested-") as temp_dir:
+                            temp_path = Path(temp_dir) / Path(name).name
+                            temp_path.write_bytes(data)
+                            nested_texts, nested_warnings = collect_archive_texts(
+                                temp_path,
+                                member_source,
+                                depth=depth + 1,
+                                max_depth=max_depth,
+                            )
+                            texts.extend(nested_texts)
+                            warnings.extend(nested_warnings)
+        except (OSError, zipfile.BadZipFile) as exc:
+            warnings.append(f"Could not read {archive_path.name}: {exc}")
+        return texts, warnings
+
+    if suffix == ".7z":
+        seven_zip = shutil.which("7z")
+        if seven_zip is None:
+            return texts, warnings
+        with tempfile.TemporaryDirectory(prefix="doc-triage-7z-") as temp_dir:
+            result = run_command([seven_zip, "x", "-y", f"-o{temp_dir}", str(archive_path)], timeout=60, max_output_chars=4000)
+            if result.exit_code != 0:
+                return texts, [f"Could not read {archive_path.name}: 7z extraction failed."]
+            root = Path(temp_dir)
+            for candidate in sorted(root.rglob("*")):
+                if not candidate.is_file():
+                    continue
+                candidate_source = f"{source_label}::{candidate.relative_to(root)}"
+                if is_textual_member_name(candidate.name):
+                    try:
+                        texts.append((candidate_source, candidate.read_text(encoding="utf-8", errors="ignore")))
+                    except OSError as exc:
+                        warnings.append(f"Could not read {archive_path.name}: {exc}")
+                elif candidate.suffix.lower() in {".docx", ".xlsx", ".pptx"}:
+                    nested_texts, nested_warnings = collect_openxml_texts(candidate, candidate_source)
+                    texts.extend(nested_texts)
+                    warnings.extend(nested_warnings)
+        return texts, warnings
+
+    return texts, warnings
+
+
+def collect_deterministic_file_findings(target: Path, file_path: Path) -> tuple[list[Finding], list[str]]:
+    findings: list[Finding] = []
+    warnings: list[str] = []
+    suffix = file_path.suffix.lower()
+    source_label = relative_source(target, file_path)
+
+    try:
+        if suffix in TEXT_EXTENSIONS:
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+            return findings_from_text(target, file_path, content), warnings
+
+        if suffix == ".eml":
+            content = parse_email_text(file_path.read_bytes())
+            return findings_from_text(target, file_path, content), warnings
+
+        if suffix in {".docx", ".xlsx", ".pptx"}:
+            texts, openxml_warnings = collect_openxml_texts(file_path, source_label)
+            warnings.extend(openxml_warnings)
+            for nested_source, content in texts:
+                findings.extend(
+                    findings_from_text(
+                        target,
+                        file_path,
+                        content,
+                        source_override=nested_source,
+                        metadata={"extracted_from": source_label},
+                    )
+                )
+            return findings, warnings
+
+        if suffix in OCR_PDF_EXTENSIONS:
+            content, pdf_warning = collect_pdf_text(file_path)
+            if pdf_warning:
+                warnings.append(pdf_warning)
+            if content:
+                findings.extend(findings_from_text(target, file_path, content))
+            return findings, warnings
+
+        if suffix in OCR_IMAGE_EXTENSIONS:
+            content, _ = collect_exif_text(file_path)
+            if content:
+                findings.extend(
+                    findings_from_text(
+                        target,
+                        file_path,
+                        content,
+                        metadata={"extracted_from": source_label, "source_mechanism": "exiftool"},
+                    )
+                )
+            return findings, warnings
+
+        if suffix in {".zip", ".7z"}:
+            texts, archive_warnings = collect_archive_texts(file_path, source_label)
+            warnings.extend(archive_warnings)
+            for nested_source, content in texts:
+                findings.extend(
+                    findings_from_text(
+                        target,
+                        file_path,
+                        content,
+                        source_override=nested_source,
+                        metadata={"extracted_from": source_label},
+                    )
+                )
+            return findings, warnings
+    except OSError as exc:
+        warnings.append(f"Could not read {file_path}: {exc}")
+
+    return findings, warnings
 
 
 def run_external_scanners(
@@ -610,6 +875,58 @@ def request_ollama_text(ollama_url: str, body: dict[str, object], timeout_second
         unregister_closeable(response)
         response.close()
     return str(payload.get("response") or payload.get("thinking") or "{}")
+
+
+def _render_archive_listing(entries: list[str], archive_path: Path, truncated: bool = False) -> str:
+    header = f"Archive: {archive_path}"
+    body = "\n".join(entries)
+    if truncated:
+        body = f"{body}\n...<truncated>" if body else "...<truncated>"
+    return f"{header}\n{body}".rstrip()
+
+
+def list_archive_contents(archive_path: Path, timeout: int = 30, max_output_chars: int = 4000) -> CommandResult:
+    suffix = archive_path.suffix.lower()
+    try:
+        if suffix == ".zip":
+            with zipfile.ZipFile(archive_path) as archive:
+                entries = archive.namelist()
+            output = _render_archive_listing(entries, archive_path)
+            stdout, truncated = truncate_output(output, max_output_chars=max_output_chars)
+            return CommandResult(exit_code=0, stdout=stdout, stderr="", timed_out=False, metadata={"stdout_truncated": truncated})
+        if suffix in {".tar", ".tgz"} or archive_path.name.lower().endswith((".tar.gz", ".tar.bz2", ".tar.xz")):
+            with tarfile.open(archive_path, "r:*") as archive:
+                entries = archive.getnames()
+            output = _render_archive_listing(entries, archive_path)
+            stdout, truncated = truncate_output(output, max_output_chars=max_output_chars)
+            return CommandResult(exit_code=0, stdout=stdout, stderr="", timed_out=False, metadata={"stdout_truncated": truncated})
+        if suffix in {".gz", ".bz2", ".xz"}:
+            if archive_path.name.lower().endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")):
+                with tarfile.open(archive_path, "r:*") as archive:
+                    entries = archive.getnames()
+            else:
+                stem = archive_path.stem
+                entries = [stem if stem else archive_path.name]
+            output = _render_archive_listing(entries, archive_path)
+            stdout, truncated = truncate_output(output, max_output_chars=max_output_chars)
+            return CommandResult(exit_code=0, stdout=stdout, stderr="", timed_out=False, metadata={"stdout_truncated": truncated})
+        if suffix in {".7z", ".rar"}:
+            if shutil.which("7z"):
+                return run_command(["7z", "l", str(archive_path)], timeout=timeout, max_output_chars=max_output_chars)
+            if shutil.which("bsdtar"):
+                return run_command(["bsdtar", "-tf", str(archive_path)], timeout=timeout, max_output_chars=max_output_chars)
+            if suffix == ".rar" and shutil.which("unrar"):
+                return run_command(["unrar", "lb", str(archive_path)], timeout=timeout, max_output_chars=max_output_chars)
+            return CommandResult(
+                exit_code=1,
+                stdout="",
+                stderr=f"No archive lister available for {archive_path.suffix} files.",
+                timed_out=False,
+            )
+    except (OSError, zipfile.BadZipFile, tarfile.TarError, EOFError, lzma.LZMAError, gzip.BadGzipFile) as exc:
+        return CommandResult(exit_code=1, stdout="", stderr=str(exc), timed_out=False)
+
+    return CommandResult(exit_code=1, stdout="", stderr=f"Unsupported archive type: {archive_path.suffix}", timed_out=False)
 
 
 def request_ollama_json(
@@ -971,9 +1288,6 @@ def parse_agent_actions(payload: object) -> list[AgentAction]:
                 kind = "dir_list" if len(candidate_path.suffix) <= 1 else "file_info"
                 if kind == "dir_list" and candidate_path.suffix:
                     path = str(candidate_path.parent) or "."
-        if kind == "pdf_text_head" and path not in {"", ".", "/input"}:
-            if Path(path).suffix.lower() not in OCR_PDF_EXTENSIONS:
-                kind = "file_info"
         if kind not in {"content_search", "filename_search", "generated_python_helper"} and not looks_like_agent_path(path):
             continue
         if kind in {"content_search", "filename_search"} and not query:
@@ -1909,7 +2223,7 @@ def execute_helper_requests(target: Path, requests: list[HelperRequest]) -> tupl
                 result = run_command(["strings", "-n", "6", str(candidate)], timeout=30, max_output_chars=4000)
                 output = "\n".join(result.stdout.splitlines()[: request.limit])
             elif request.kind == "zip_list" and candidate.is_file():
-                result = run_command(["unzip", "-l", str(candidate)], timeout=30, max_output_chars=4000)
+                result = list_archive_contents(candidate, timeout=30, max_output_chars=4000)
                 output = result.stdout or result.stderr
             elif request.kind == "pdf_text_head" and candidate.is_file():
                 with tempfile.TemporaryDirectory(prefix="doc-triage-pdf-head-") as temp_dir:
@@ -2396,7 +2710,7 @@ def execute_agent_actions(
                 if result.timed_out:
                     warnings.append(f"agent action timed out after {action_timeout}s: {action.kind} {action.path}")
             elif action.kind == "zip_list" and candidate is not None and candidate.is_file():
-                result = run_command(["unzip", "-l", str(candidate)], timeout=action_timeout, max_output_chars=4000)
+                result = list_archive_contents(candidate, timeout=action_timeout, max_output_chars=4000)
                 observations.append(
                     normalize_agent_observation(
                         path=relative_source(target, candidate),
