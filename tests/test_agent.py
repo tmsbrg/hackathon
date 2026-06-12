@@ -115,6 +115,26 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(actions[0].path, ".")
         self.assertIn("dir_list", actions[0].reason)
 
+    def test_parse_agent_actions_accepts_action_target_description_shape(self) -> None:
+        actions = cli.parse_agent_actions(
+            [{"action": "content_search", "target": "/tmp/case", "pattern": "elliots|sequence", "description": "Cross-reference"}]
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "content_search")
+        self.assertEqual(actions[0].query, "elliots|sequence")
+        self.assertEqual(actions[0].reason, "Cross-reference")
+
+    def test_parse_agent_actions_accepts_name_args_shape(self) -> None:
+        actions = cli.parse_agent_actions(
+            [{"name": "read_head", "args": {"path": "docs/a.txt", "limit": 7}}]
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "read_head")
+        self.assertEqual(actions[0].path, "docs/a.txt")
+        self.assertEqual(actions[0].limit, 7)
+
     def test_build_agent_plan_prompt_preserves_safety_instructions_with_malicious_preview(self) -> None:
         prompt = cli.build_agent_plan_prompt(
             Path("/tmp/case"),
@@ -335,6 +355,39 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(len(hypotheses), 1)
         self.assertEqual(len(actions), 1)
+
+    @mock.patch("doc_triage.cli.urlopen")
+    def test_request_agent_plan_accepts_loose_schema_without_repair(self, urlopen: mock.Mock) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        response.read.return_value = json.dumps(
+            {
+                "response": json.dumps(
+                    {
+                        "hypothesis": "Investigate Elliot stash",
+                        "actions": [
+                            {
+                                "action": "dir_list",
+                                "target": "ctf_cases/elliots_secret_stash/ctf",
+                                "description": "List archive directory",
+                            }
+                        ],
+                    }
+                )
+            }
+        ).encode("utf-8")
+        urlopen.return_value = response
+
+        hypotheses, actions = cli.request_agent_plan(
+            "http://127.0.0.1:11434",
+            "qwen3:8b",
+            {"instructions": ["Return hypotheses and actions"]},
+        )
+
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(hypotheses[0].label, "Investigate Elliot stash")
+        self.assertEqual(actions[0].kind, "dir_list")
 
     @mock.patch("doc_triage.cli.urlopen")
     def test_request_agent_summary_repairs_non_json_response_once(self, urlopen: mock.Mock) -> None:

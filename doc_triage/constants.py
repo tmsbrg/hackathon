@@ -75,6 +75,7 @@ ANSI_COLORS = {
     "info": "\033[36m",
 }
 NON_FATAL_WARNING_PREFIXES = (
+    "agent planning failed:",
     "agent summary failed:",
     "agent refinement failed:",
     "Ollama response repair failed:",
