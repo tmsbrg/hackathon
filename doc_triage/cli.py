@@ -47,6 +47,16 @@ KEYWORD_RULES = {
 }
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 REGISTERED_TEMPDIRS: set[Path] = set()
+ANSI_RESET = "\033[0m"
+ANSI_COLORS = {
+    "critical": "\033[1;31m",
+    "high": "\033[31m",
+    "medium": "\033[33m",
+    "low": "\033[36m",
+    "ok": "\033[32m",
+    "warning": "\033[33m",
+    "info": "\033[36m",
+}
 
 
 @dataclass(slots=True)
@@ -154,7 +164,55 @@ def run_doctor() -> int:
 def truncate_output(value: str, max_output_chars: int) -> tuple[str, bool]:
     if len(value) <= max_output_chars:
         return value, False
-    return value[:max_output_chars], True
+    truncated = value[:max_output_chars]
+    last_newline = truncated.rfind("\n")
+    if last_newline > 0:
+        truncated = truncated[: last_newline + 1]
+    return truncated, True
+
+
+def colorize(label: str, color: str) -> str:
+    return f"{ANSI_COLORS[color]}{label}{ANSI_RESET}"
+
+
+def summarize_findings(findings: list[Finding], warnings: list[str]) -> list[str]:
+    by_severity = {severity: 0 for severity in SEVERITY_ORDER}
+    for finding in findings:
+        by_severity[finding.severity] = by_severity.get(finding.severity, 0) + 1
+
+    lines = [
+        colorize("Scan Summary", "info"),
+        f"  Findings: {len(findings)}  Warnings: {len(warnings)}",
+        "  Severity: "
+        + ", ".join(
+            f"{colorize(severity, severity)}={by_severity[severity]}"
+            for severity in ("critical", "high", "medium", "low")
+            if by_severity.get(severity, 0)
+        ),
+    ]
+
+    if warnings:
+        lines.append(f"  {colorize('Warnings', 'warning')}:")
+        for warning in warnings[:5]:
+            lines.append(f"    - {warning}")
+
+    ranked = sorted(
+        findings,
+        key=lambda finding: (
+            -SEVERITY_ORDER.get(finding.severity, 0),
+            -finding.confidence,
+            finding.source,
+            finding.line or -1,
+        ),
+    )
+    if ranked:
+        lines.append("  Top findings:")
+        for finding in ranked[:5]:
+            location = f"{finding.source}:{finding.line}" if finding.line is not None else finding.source
+            lines.append(
+                f"    - {colorize(finding.severity, finding.severity)} {location} [{finding.category}] via {finding.detector}"
+            )
+    return lines
 
 
 def run_command(
@@ -896,6 +954,7 @@ def run_scan(args: argparse.Namespace) -> int:
     report = render_report(args, target, findings, warnings, llm_summary=llm_summary)
     write_report(output_path, report)
     verbose_log(args.verbose, "Report written successfully")
+    print("\n".join(summarize_findings(findings, warnings)))
 
     statuses = detect_tools()
     missing_required = [tool.name for tool in statuses if tool.required and not tool.path]

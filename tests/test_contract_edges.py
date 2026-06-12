@@ -16,6 +16,14 @@ class ContractEdgeTests(unittest.TestCase):
         self.assertTrue(result.metadata["stdout_truncated"])
         self.assertLessEqual(len(result.stdout), 100)
 
+    def test_truncate_output_preserves_complete_lines_when_possible(self) -> None:
+        value = "first line\nsecond line\nthird line\n"
+
+        truncated, did_truncate = cli.truncate_output(value, 20)
+
+        self.assertTrue(did_truncate)
+        self.assertEqual(truncated, "first line\n")
+
     @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
     def test_scan_target_respects_exclude_globs(self, _: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -141,6 +149,36 @@ class ContractEdgeTests(unittest.TestCase):
             cli.cleanup_tempdirs()
 
             self.assertFalse(temp_path.exists())
+
+    @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
+    @mock.patch(
+        "doc_triage.cli.detect_tools",
+        return_value=[
+            cli.ToolStatus("rg", "/usr/bin/rg", True),
+            cli.ToolStatus("rga", "/usr/bin/rga", True),
+            cli.ToolStatus("trufflehog", "/usr/bin/trufflehog", True),
+            cli.ToolStatus("tesseract", "/usr/bin/tesseract", False),
+            cli.ToolStatus("ocrmypdf", "/usr/bin/ocrmypdf", False),
+            cli.ToolStatus("pdftotext", "/usr/bin/pdftotext", False),
+            cli.ToolStatus("ollama", "/usr/bin/ollama", False),
+        ],
+    )
+    def test_scan_prints_colorized_terminal_summary(self, _: mock.Mock, __: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, "case")
+            target.mkdir()
+            (target / "loot.txt").write_text("password=secret\n", encoding="utf-8")
+            output = target / "report.md"
+            stdout = StringIO()
+
+            with mock.patch("sys.stdout", stdout):
+                exit_code = cli.main(["scan", str(target), "--output", str(output), "--no-llm"])
+
+        self.assertEqual(exit_code, 0)
+        rendered = stdout.getvalue()
+        self.assertIn("Scan Summary", rendered)
+        self.assertIn("\033[", rendered)
+        self.assertIn("Top findings:", rendered)
 
 
 if __name__ == "__main__":
