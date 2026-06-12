@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import os
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -247,6 +248,51 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(actions[0].kind, "read_head")
         self.assertEqual(actions[0].path, "ctf_cases/bad_blockchain/ctf/bad-blockchain.txt")
 
+    def test_parse_agent_plan_lines_accepts_positional_refinement_shape(self) -> None:
+        payload = (
+            'ctf_cases/sequence/ctf/sequence.txt|filename_search|'
+            'To find all relevant files within the target directory for further investigation.|'
+            './ctf_cases/sequence/ctf|"ctf_cases/representative-mixed"|50|5\n'
+        )
+
+        hypotheses, actions = cli.parse_agent_plan_lines(payload)
+
+        self.assertEqual(hypotheses, [])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "filename_search")
+        self.assertEqual(actions[0].query, "ctf_cases/representative-mixed")
+        self.assertEqual(actions[0].metadata["timeout_seconds"], "5")
+
+    def test_parse_agent_plan_lines_accepts_kind_marker_action_shape(self) -> None:
+        payload = (
+            'content_search|kind|"IP address"|target_or_query|ctf_cases/bad_blockchain/ctf/bad-blockchain.txt|'
+            'reason|The bad blockchain case specifically mentions finding an IP address in the Bitcoin transaction data.|4\n'
+        )
+
+        hypotheses, actions = cli.parse_agent_plan_lines(payload)
+
+        self.assertEqual(hypotheses, [])
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "content_search")
+        self.assertEqual(actions[0].query, "IP address")
+        self.assertEqual(actions[0].reason, "The bad blockchain case specifically mentions finding an IP address in the Bitcoin transaction data.")
+
+    def test_parse_agent_plan_lines_accepts_hypothesis_action_hybrid_shape(self) -> None:
+        payload = (
+            "hypothesis|label|The bad blockchain case requires extracting an IP address from Bitcoin transaction data.|"
+            "status and action|kind|pdf_text_head|target_or_query|dfir_archives/coffee_handout_extracted/challenge.pcapng|"
+            "reason|PCAP files often contain network traffic that could reveal credentials or other sensitive information related to Bitcoin transactions.|"
+            "limit|20|timeout_seconds|20\n"
+        )
+
+        hypotheses, actions = cli.parse_agent_plan_lines(payload)
+
+        self.assertEqual(len(hypotheses), 1)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].kind, "pdf_text_head")
+        self.assertEqual(actions[0].path, "dfir_archives/coffee_handout_extracted/challenge.pcapng")
+        self.assertEqual(actions[0].metadata["timeout_seconds"], "20")
+
     def test_merge_agent_actions_backfills_with_fallback(self) -> None:
         merged = cli.merge_agent_actions(
             [cli.AgentAction(kind="dir_list", path=".", reason="planned")],
@@ -333,6 +379,28 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0].source_mechanism, "dir_list")
+
+    def test_execute_agent_actions_accepts_cwd_relative_target_prefixed_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            root = workspace / "corpora" / "representative-mixed"
+            docs = root / "docs"
+            docs.mkdir(parents=True)
+            (docs / "note.txt").write_text("secret\n", encoding="utf-8")
+            previous = Path.cwd()
+            try:
+                os.chdir(workspace)
+                observations, warnings = cli.execute_agent_actions(
+                    root,
+                    [cli.AgentAction(kind="dir_list", path="corpora/representative-mixed/docs", reason="inspect dir", limit=5)],
+                    per_action_timeout=5,
+                )
+            finally:
+                os.chdir(previous)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].path, "docs")
 
     @mock.patch("doc_triage.cli.run_command")
     def test_execute_agent_actions_skips_strings_on_image_targets(self, run_command: mock.Mock) -> None:

@@ -636,7 +636,10 @@ def parse_agent_actions(payload: object) -> list[AgentAction]:
         stripped = value.strip()
         for prefix in ("target_or_query:", "path:", "query:", "kind:", "reason:", "label:", "rationale:", "status:"):
             if stripped.lower().startswith(prefix):
-                return stripped[len(prefix) :].strip()
+                stripped = stripped[len(prefix) :].strip()
+                break
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+            stripped = stripped[1:-1].strip()
         return stripped
 
     if not isinstance(payload, list):
@@ -850,6 +853,39 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
             if hypothesis is not None:
                 hypotheses.append(hypothesis)
                 continue
+            if len(parts) >= 4:
+                remainder = parts[1:]
+                if remainder and remainder[0].lower() == "kind":
+                    remainder = remainder[1:]
+                payload_item: dict[str, object] = {"kind": record_type}
+                if record_type in {"content_search", "filename_search"}:
+                    if len(remainder) >= 2 and remainder[1].lower() in {"target_or_query", "path", "query"}:
+                        payload_item["query"] = remainder[0]
+                        remainder = remainder[1:]
+                    elif remainder:
+                        payload_item["query"] = remainder[0]
+                        remainder = remainder[1:]
+                elif remainder:
+                    payload_item["path"] = remainder[0]
+                    remainder = remainder[1:]
+                index = 0
+                trailing_values: list[str] = []
+                while index < len(remainder):
+                    token = remainder[index].lower()
+                    if token in {"target_or_query", "path", "query", "reason", "limit", "timeout_seconds"} and index + 1 < len(remainder):
+                        payload_item[token] = remainder[index + 1]
+                        index += 2
+                        continue
+                    if remainder[index]:
+                        trailing_values.append(remainder[index])
+                    index += 1
+                if trailing_values:
+                    if "limit" not in payload_item:
+                        payload_item["limit"] = trailing_values[0]
+                    elif len(trailing_values) >= 2 and "timeout_seconds" not in payload_item:
+                        payload_item["timeout_seconds"] = trailing_values[1]
+                actions.extend(parse_agent_actions([payload_item]))
+                continue
         if record_type == "hypothesis":
             kv = _parse_kv_parts(parts)
             if kv:
@@ -857,6 +893,18 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
                 if hypothesis is not None:
                     hypotheses.append(hypothesis)
                 continue
+            if "kind" in parts[1:]:
+                kind_index = parts.index("kind")
+                action_fields: dict[str, str] = {}
+                for index in range(kind_index, len(parts) - 1, 2):
+                    action_fields[parts[index].lower()] = parts[index + 1]
+                if "kind" in action_fields:
+                    actions.extend(_parse_action_fields(action_fields))
+                    rationale = parts[2] if len(parts) >= 3 else ""
+                    label = parts[1] if len(parts) >= 2 and parts[1].lower() != "label" else rationale[:80]
+                    if label and rationale:
+                        hypotheses.append(AgentHypothesis(label=label, rationale=rationale, status="inconclusive"))
+                    continue
         if record_type.startswith("hyp_") and len(parts) >= 6:
             label = parts[2] or parts[1]
             status = parts[3] or "inconclusive"
@@ -884,6 +932,23 @@ def parse_agent_plan_lines(payload: str) -> tuple[list[AgentHypothesis], list[Ag
                         ]
                     )
                 )
+            continue
+        positional_kind = _derive_kind(parts[1], parts[3] if len(parts) >= 4 else "") if len(parts) >= 2 else ""
+        if positional_kind and len(parts) >= 6:
+            limit = _parse_numeric(parts[5], "", 20)
+            timeout_seconds = _parse_numeric(parts[6], "", 0) if len(parts) >= 7 else 0
+            payload_item = {
+                "kind": positional_kind,
+                "reason": parts[2] if len(parts) >= 3 else f"Investigate via {positional_kind}.",
+                "limit": limit,
+                "timeout_seconds": timeout_seconds,
+            }
+            if positional_kind in {"content_search", "filename_search"}:
+                payload_item["query"] = parts[4]
+                payload_item["path"] = parts[3]
+            else:
+                payload_item["path"] = parts[3]
+            actions.extend(parse_agent_actions([payload_item]))
             continue
         if record_type == "hypothesis" and len(parts) >= 3:
             if len(parts) >= 6 and _derive_kind(parts[3], parts[4]):
@@ -1582,6 +1647,39 @@ def validate_agent_action_target(action: AgentAction, candidate: Path | None) ->
     return None
 
 
+def resolve_agent_action_path(target: Path, path: str) -> Path | None:
+    if path in {"", "."}:
+        return target.resolve()
+
+    raw = Path(path)
+    target_root = target.resolve()
+    if raw.is_absolute():
+        try:
+            raw.relative_to(target_root)
+            return raw
+        except ValueError:
+            return None
+
+    cwd_candidate = (Path.cwd() / raw).resolve()
+    try:
+        cwd_candidate.relative_to(target_root)
+        if cwd_candidate.exists():
+            return cwd_candidate
+    except ValueError:
+        pass
+
+    if target_root.name in raw.parts:
+        suffix_parts = raw.parts[raw.parts.index(target_root.name) + 1 :]
+        if suffix_parts:
+            stripped = safe_relative_path(target, str(Path(*suffix_parts)))
+            if stripped is not None and stripped.exists():
+                return stripped
+    direct = safe_relative_path(target, path)
+    if direct is not None and direct.exists():
+        return direct
+    return None
+
+
 def execute_agent_actions(
     target: Path,
     actions: list[AgentAction],
@@ -1598,7 +1696,7 @@ def execute_agent_actions(
         if action.kind not in AGENT_ACTION_KINDS:
             warnings.append(f"unsupported agent action: {action.kind}")
             continue
-        candidate = safe_relative_path(target, action.path) if action.path not in {"", "."} else target
+        candidate = resolve_agent_action_path(target, action.path)
         target_warning = validate_agent_action_target(action, candidate)
         if target_warning is not None:
             warnings.append(target_warning)
