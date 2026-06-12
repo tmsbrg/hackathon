@@ -45,7 +45,7 @@ doc-triage scan TARGET
   [--max-llm-files N]
   [--exclude GLOB]
   [--no-llm]
-  [--agent]
+  [--multi-agent]
   [--agent-max-actions N]
   [--agent-timeout SECONDS]
   [--model-retries N]
@@ -94,7 +94,7 @@ Run the agent loop with verbose planning output:
 doc-triage --verbose scan /path/to/share \
   --output report.md \
   --model haervwe/GLM-4.6V-Flash-9B \
-  --agent \
+  --multi-agent \
   --agent-max-actions 8 \
   --agent-timeout 30
 ```
@@ -283,7 +283,7 @@ Every report includes:
 7. Interesting documents and relationships
 8. Files to review first
 
-When `--agent` is enabled, the report also adds:
+When `--multi-agent` is enabled, the report also adds:
 
 9. Agent investigation plan
 10. Agent observations

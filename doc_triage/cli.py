@@ -1028,7 +1028,13 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--max-llm-files", type=int, default=30)
     scan.add_argument("--exclude", action="append", default=[])
     scan.add_argument("--no-llm", action="store_true")
-    scan.add_argument("--agent", action="store_true")
+    scan.add_argument(
+        "--multi-agent",
+        "--agent",
+        dest="agent",
+        action="store_true",
+        help="Enable the multi-agent subagent planning and investigation flow.",
+    )
     scan.add_argument("--agent-max-actions", type=int, default=8)
     scan.add_argument("--agent-timeout", type=int, default=30)
     scan.add_argument("--model-retries", type=int, default=1)

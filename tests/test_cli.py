@@ -30,6 +30,11 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("--ollama-timeout must be >= 1", stderr.getvalue())
 
+    def test_scan_accepts_multi_agent_flag_alias(self) -> None:
+        args = cli.build_parser().parse_args(["scan", "/tmp", "--multi-agent"])
+
+        self.assertTrue(args.agent)
+
     def test_doctor_reports_missing_required_dependencies(self) -> None:
         stdout = StringIO()
         with mock.patch("sys.stdout", stdout):
