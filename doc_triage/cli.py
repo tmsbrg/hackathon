@@ -117,6 +117,14 @@ class Finding:
     metadata: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class HelperRequest:
+    kind: str
+    path: str
+    reason: str
+    limit: int = 20
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="doc-triage")
     parser.add_argument("--verbose", action="store_true")
@@ -251,6 +259,15 @@ def summarize_findings(findings: list[Finding], warnings: list[str]) -> list[str
             )
             lines.append(f"      Evidence: {summarize_evidence(finding.evidence)}")
     return lines
+
+
+def safe_relative_path(target: Path, relative_path: str) -> Path | None:
+    candidate = (target / relative_path).resolve()
+    try:
+        candidate.relative_to(target)
+    except ValueError:
+        return None
+    return candidate
 
 
 def run_command(
@@ -745,8 +762,157 @@ def parse_trufflehog_output(payload: str, target: Path) -> tuple[list[Finding], 
     return findings, warnings
 
 
-def generate_llm_summary(ollama_url: str, model: str, findings: list[Finding], max_files: int) -> dict[str, object]:
+def build_llm_recon_context(target: Path, findings: list[Finding], max_files: int) -> dict[str, object]:
+    files = [path for path in sorted(target.rglob("*")) if path.is_file()]
+    sample_files = files[: min(len(files), max_files)]
+    interesting_sources = list(dict.fromkeys(finding.source for finding in findings[:max_files]))
+    head_samples: list[dict[str, str]] = []
+    for relative in interesting_sources[:5]:
+        candidate = safe_relative_path(target, relative)
+        if candidate is None or not candidate.exists() or not candidate.is_file():
+            continue
+        try:
+            preview = candidate.read_text(encoding="utf-8", errors="ignore")[:600]
+        except OSError:
+            continue
+        if preview.strip():
+            head_samples.append({"path": relative, "preview": preview})
+
+    return {
+        "file_count": len(files),
+        "sample_files": [relative_source(target, path) for path in sample_files],
+        "top_findings": [
+            {
+                "source": finding.source,
+                "category": finding.category,
+                "severity": finding.severity,
+                "evidence": finding.evidence,
+                "line": finding.line,
+            }
+            for finding in findings[:max_files]
+        ],
+        "head_samples": head_samples,
+    }
+
+
+def parse_helper_plan(payload: object) -> list[HelperRequest]:
+    if not isinstance(payload, list):
+        return []
+    requests: list[HelperRequest] = []
+    for item in payload[:8]:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "")).strip()
+        path = str(item.get("path", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        limit = item.get("limit", 20)
+        if not kind or not path:
+            continue
+        if not isinstance(limit, int):
+            limit = 20
+        requests.append(HelperRequest(kind=kind, path=path, reason=reason, limit=max(1, min(limit, 50))))
+    return requests
+
+
+def generate_llm_helper_plan(
+    ollama_url: str,
+    model: str,
+    target: Path,
+    findings: list[Finding],
+    max_files: int,
+) -> list[HelperRequest]:
+    recon = build_llm_recon_context(target, findings, max_files)
+    prompt = {
+        "instructions": [
+            "You are planning read-only helper actions for local document triage.",
+            "Choose at most 8 helper requests.",
+            "Only use helper kinds: read_head, strings_head, zip_list, pdf_text_head, file_info, dir_list.",
+            "Prefer files with findings or files whose names imply useful content.",
+            "Return strict JSON as an array of helper request objects with keys kind, path, reason, limit.",
+        ],
+        "target": str(target),
+        "recon": recon,
+    }
+    try:
+        parsed = request_ollama_json(
+            ollama_url,
+            {
+                "model": model,
+                "stream": False,
+                "think": False,
+                "format": "json",
+                "prompt": json.dumps(prompt),
+            },
+        )
+    except Exception:
+        return []
+    return parse_helper_plan(parsed if isinstance(parsed, list) else parsed.get("helper_requests"))
+
+
+def execute_helper_requests(target: Path, requests: list[HelperRequest]) -> tuple[list[dict[str, object]], list[str]]:
+    results: list[dict[str, object]] = []
+    warnings: list[str] = []
+    for request in requests:
+        candidate = safe_relative_path(target, request.path)
+        if candidate is None or not candidate.exists():
+            warnings.append(f"LLM helper skipped missing path: {request.path}")
+            continue
+        try:
+            if request.kind == "read_head" and candidate.is_file():
+                content = candidate.read_text(encoding="utf-8", errors="ignore")
+                output = content[: min(request.limit * 120, 4000)]
+            elif request.kind == "strings_head" and candidate.is_file():
+                result = run_command(["strings", "-n", "6", str(candidate)], timeout=30, max_output_chars=4000)
+                output = "\n".join(result.stdout.splitlines()[: request.limit])
+            elif request.kind == "zip_list" and candidate.is_file():
+                result = run_command(["unzip", "-l", str(candidate)], timeout=30, max_output_chars=4000)
+                output = result.stdout or result.stderr
+            elif request.kind == "pdf_text_head" and candidate.is_file():
+                with tempfile.TemporaryDirectory(prefix="doc-triage-pdf-head-") as temp_dir:
+                    text_path = Path(temp_dir) / f"{candidate.stem}.txt"
+                    result = run_command(["pdftotext", str(candidate), str(text_path)], timeout=30, max_output_chars=2000)
+                    if result.exit_code != 0 or not text_path.exists():
+                        output = result.stderr or "pdftotext failed"
+                    else:
+                        output = text_path.read_text(encoding="utf-8", errors="ignore")[: min(request.limit * 120, 4000)]
+            elif request.kind == "file_info":
+                result = run_command(["file", "-b", str(candidate)], timeout=10, max_output_chars=1000)
+                output = result.stdout.strip() or result.stderr.strip()
+            elif request.kind == "dir_list" and candidate.is_dir():
+                entries = sorted(path.name for path in candidate.iterdir())[: request.limit]
+                output = "\n".join(entries)
+            else:
+                warnings.append(f"LLM helper skipped unsupported request: {request.kind} {request.path}")
+                continue
+        except OSError as exc:
+            warnings.append(f"LLM helper failed for {request.path}: {exc}")
+            continue
+        if output.strip():
+            results.append(
+                {
+                    "kind": request.kind,
+                    "path": request.path,
+                    "reason": request.reason,
+                    "output": output,
+                }
+            )
+    return results, warnings
+
+
+def generate_llm_summary(
+    ollama_url: str,
+    model: str,
+    target: Path,
+    findings: list[Finding],
+    max_files: int,
+    verbose: bool = False,
+) -> dict[str, object]:
     selected_findings = select_llm_findings(findings, max_files)
+    recon = build_llm_recon_context(target, findings, max_files)
+    helper_requests = generate_llm_helper_plan(ollama_url, model, target, findings, max_files)
+    helper_results, helper_warnings = execute_helper_requests(target, helper_requests)
+    for warning in helper_warnings:
+        verbose_log(verbose, warning)
     evidence_lines = [
         {
             "source": finding.source,
@@ -764,6 +930,12 @@ def generate_llm_summary(ollama_url: str, model: str, findings: list[Finding], m
             "Do not invent findings.",
             "Return strict JSON with executive_summary, priority_findings, relationships, review_order.",
         ],
+        "recon": recon,
+        "helper_requests": [
+            {"kind": request.kind, "path": request.path, "reason": request.reason, "limit": request.limit}
+            for request in helper_requests
+        ],
+        "helper_results": helper_results,
         "findings": evidence_lines,
     }
     required_keys = {"executive_summary", "priority_findings", "relationships", "review_order"}
@@ -1004,7 +1176,14 @@ def run_scan(args: argparse.Namespace) -> int:
     if not args.no_llm and findings:
         verbose_log(args.verbose, f"Requesting LLM summary with model {args.model}")
         try:
-            llm_summary = generate_llm_summary(args.ollama_url, args.model, findings, args.max_llm_files)
+            llm_summary = generate_llm_summary(
+                args.ollama_url,
+                args.model,
+                target,
+                findings,
+                args.max_llm_files,
+                verbose=args.verbose,
+            )
             llm_summary = normalize_llm_summary(llm_summary)
             verbose_log(args.verbose, "LLM summary completed")
         except RuntimeError as exc:

@@ -208,7 +208,14 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(rendered, "")
 
     @mock.patch("doc_triage.cli.urlopen")
-    def test_ollama_summary_parses_json_response(self, urlopen: mock.Mock) -> None:
+    @mock.patch("doc_triage.cli.execute_helper_requests", return_value=([], []))
+    @mock.patch("doc_triage.cli.generate_llm_helper_plan", return_value=[])
+    def test_ollama_summary_parses_json_response(
+        self,
+        _: mock.Mock,
+        __: mock.Mock,
+        urlopen: mock.Mock,
+    ) -> None:
         response = mock.Mock()
         response.__enter__ = mock.Mock(return_value=response)
         response.__exit__ = mock.Mock(return_value=False)
@@ -229,6 +236,7 @@ class IntegrationTests(unittest.TestCase):
         result = cli.generate_llm_summary(
             "http://127.0.0.1:11434",
             "qwen3:8b",
+            Path("/tmp/case"),
             [
                 cli.Finding(
                     source="a.txt",
@@ -245,6 +253,28 @@ class IntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(result["executive_summary"], "summary")
+
+    def test_execute_helper_requests_reads_file_heads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            sample = target / "notes.txt"
+            sample.write_text("line one\nline two\n", encoding="utf-8")
+
+            results, warnings = cli.execute_helper_requests(
+                target,
+                [cli.HelperRequest(kind="read_head", path="notes.txt", reason="inspect text", limit=5)],
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(results), 1)
+        self.assertIn("line one", results[0]["output"])
+
+    def test_parse_helper_plan_limits_requests(self) -> None:
+        payload = [{"kind": "read_head", "path": f"file-{index}.txt", "reason": "inspect"} for index in range(12)]
+
+        requests = cli.parse_helper_plan(payload)
+
+        self.assertEqual(len(requests), 8)
 
     @mock.patch("doc_triage.cli.generate_llm_summary")
     @mock.patch("doc_triage.cli.scan_target")

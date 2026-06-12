@@ -67,7 +67,14 @@ class ContractEdgeTests(unittest.TestCase):
             self.assertNotIn("report.md:", report)
 
     @mock.patch("doc_triage.cli.urlopen")
-    def test_llm_summary_repairs_non_json_response_once(self, urlopen: mock.Mock) -> None:
+    @mock.patch("doc_triage.cli.execute_helper_requests", return_value=([], []))
+    @mock.patch("doc_triage.cli.generate_llm_helper_plan", return_value=[])
+    def test_llm_summary_repairs_non_json_response_once(
+        self,
+        _: mock.Mock,
+        __: mock.Mock,
+        urlopen: mock.Mock,
+    ) -> None:
         first = mock.Mock()
         first.__enter__ = mock.Mock(return_value=first)
         first.__exit__ = mock.Mock(return_value=False)
@@ -93,6 +100,7 @@ class ContractEdgeTests(unittest.TestCase):
         result = cli.generate_llm_summary(
             "http://127.0.0.1:11434",
             "qwen3:8b",
+            Path("/tmp/case"),
             [
                 cli.Finding(
                     source="a.txt",
