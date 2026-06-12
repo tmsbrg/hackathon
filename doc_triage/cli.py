@@ -1028,6 +1028,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--max-llm-files", type=int, default=30)
     scan.add_argument("--exclude", action="append", default=[])
     scan.add_argument("--no-llm", action="store_true")
+    scan.add_argument("--no-dedup", action="store_true")
     scan.add_argument(
         "--agent",
         action="store_true",
@@ -1050,6 +1051,7 @@ def scan_target(
     ocr: bool = False,
     exclude_globs: Sequence[str] | None = None,
     verbose: bool = False,
+    dedup: bool = True,
 ) -> tuple[list[Finding], list[str]]:
     warnings: list[str] = []
     findings: list[Finding] = []
@@ -1098,7 +1100,7 @@ def scan_target(
         warnings.extend(ocr_warnings)
         progress_log(verbose, "ocr", f"OCR produced {len(ocr_findings)} findings and {len(ocr_warnings)} warnings")
 
-    return deduplicate_findings(findings), warnings
+    return (deduplicate_findings(findings) if dedup else findings), warnings
 
 
 def findings_from_text(
@@ -5255,6 +5257,7 @@ def run_scan(args: argparse.Namespace) -> int:
         ocr=args.ocr,
         exclude_globs=exclude_globs,
         verbose=args.verbose,
+        dedup=not args.no_dedup,
     )
     progress_log(args.verbose, "scan", f"Deterministic scan produced {len(findings)} findings and {len(warnings)} warnings")
     agent_run: AgentRun | None = None

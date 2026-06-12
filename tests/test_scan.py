@@ -156,6 +156,35 @@ class ScanLogicTests(unittest.TestCase):
         self.assertEqual(deduped[0].severity, "high")
         self.assertEqual(deduped[0].detector, "rga")
 
+    def test_deduplicate_findings_collapses_same_sensitive_value_from_same_file(self) -> None:
+        findings = [
+            cli.Finding(
+                source="a.txt",
+                category="credential",
+                severity="high",
+                detector="built-in",
+                evidence="password=Welkom123",
+                line=1,
+                confidence=0.9,
+                metadata={},
+            ),
+            cli.Finding(
+                source="a.txt",
+                category="credential",
+                severity="medium",
+                detector="trufflehog",
+                evidence="Welkom123",
+                line=None,
+                confidence=0.8,
+                metadata={},
+            ),
+        ]
+
+        deduped = cli.deduplicate_findings(findings)
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0].evidence, "password=Welkom123")
+
     @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
     def test_scan_target_marks_sensitive_filenames_even_without_text_hits(self, _: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -168,6 +197,44 @@ class ScanLogicTests(unittest.TestCase):
             self.assertEqual(warnings, [])
             self.assertEqual(len(findings), 1)
             self.assertEqual(findings[0].category, "sensitive-file")
+
+    @mock.patch("doc_triage.cli.run_external_scanners")
+    def test_scan_target_can_disable_dedup(self, run_external_scanners: mock.Mock) -> None:
+        run_external_scanners.return_value = (
+            [
+                cli.Finding(
+                    source="note.txt",
+                    category="credential",
+                    severity="high",
+                    detector="rga",
+                    evidence="password=Welkom123",
+                    line=1,
+                    confidence=0.9,
+                    metadata={},
+                ),
+                cli.Finding(
+                    source="note.txt",
+                    category="credential",
+                    severity="medium",
+                    detector="trufflehog",
+                    evidence="Welkom123",
+                    line=None,
+                    confidence=0.8,
+                    metadata={},
+                ),
+            ],
+            [],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / "note.txt").write_text("password=Welkom123\n", encoding="utf-8")
+
+            findings, warnings = cli.scan_target(target, max_files=None, dedup=False)
+
+        self.assertEqual(warnings, [])
+        self.assertGreaterEqual(len(findings), 2)
+        self.assertTrue(any(item.detector == "rga" for item in findings))
+        self.assertTrue(any(item.detector == "trufflehog" for item in findings))
 
     @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
     def test_scan_target_ignores_office_lockfiles(self, _: mock.Mock) -> None:

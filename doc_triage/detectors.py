@@ -20,6 +20,16 @@ from .constants import (
 )
 from .models import Finding
 
+DEDUP_VALUE_PATTERN = re.compile(
+    r"""(?ix)
+    \b(?:password|passwords|passwd|pwd|pass|passphrase|wachtwoord|wachtwoorden|toegangscode|
+    secret|shared[_ -]?secret|client[_ -]?secret|api[_ -]?key(?:[_ -]?value)?|access[_ -]?token|
+    refresh[_ -]?token|auth[_ -]?token|bearer[_ -]?token|private[_ -]?key|bsn|burgerservicenummer)\b
+    [^:=\n]*[:=]\s*["']?([^"'\s,`]+)
+    """
+)
+RAW_SECRET_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9+/=_-]{8,}$")
+
 
 def severity_rank(value: str) -> int:
     return SEVERITY_ORDER.get(value, 0)
@@ -35,9 +45,9 @@ def is_valid_bsn(value: str) -> bool:
 
 
 def deduplicate_findings(findings: list[Finding]) -> list[Finding]:
-    deduped: dict[tuple[str, str, str], Finding] = {}
+    deduped: dict[tuple[str, str], Finding] = {}
     for finding in findings:
-        key = (finding.source, finding.category, finding.evidence.strip().lower())
+        key = (finding.source, canonical_finding_value(finding))
         current = deduped.get(key)
         if current is None:
             deduped[key] = finding
@@ -51,6 +61,17 @@ def deduplicate_findings(findings: list[Finding]) -> list[Finding]:
         deduped.values(),
         key=lambda finding: (-severity_rank(finding.severity), finding.source, finding.line or 0, finding.evidence),
     )
+
+
+def canonical_finding_value(finding: Finding) -> str:
+    evidence = finding.evidence.strip()
+    if finding.category in {"credential", "personal-data", "financial-data"}:
+        match = DEDUP_VALUE_PATTERN.search(evidence)
+        if match:
+            return match.group(1).strip().lower()
+        if RAW_SECRET_VALUE_PATTERN.fullmatch(evidence):
+            return evidence.lower()
+    return evidence.lower()
 
 
 def is_noise_evidence(text: str) -> bool:

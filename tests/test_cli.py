@@ -40,6 +40,11 @@ class CliContractTests(unittest.TestCase):
 
         self.assertTrue(args.agent)
 
+    def test_scan_accepts_no_dedup_flag(self) -> None:
+        args = cli.build_parser().parse_args(["scan", "/tmp", "--no-dedup"])
+
+        self.assertTrue(args.no_dedup)
+
     def test_scan_rejects_both_agent_modes(self) -> None:
         stderr = StringIO()
         with mock.patch("sys.stderr", stderr):
