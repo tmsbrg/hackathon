@@ -32,6 +32,39 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(findings[0].detector, "rga")
         self.assertEqual(findings[0].source, "notes.txt")
 
+    def test_parse_rga_json_skips_license_and_url_noise(self) -> None:
+        payload = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "match",
+                        "data": {
+                            "path": {"text": "/tmp/case/LICENSE.txt"},
+                            "line_number": 1,
+                            "lines": {"text": "MIT License"},
+                            "submatches": [{"match": {"text": "License"}}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "match",
+                        "data": {
+                            "path": {"text": "/tmp/case/link.txt"},
+                            "line_number": 2,
+                            "lines": {"text": "https://drive.google.com/file/d/abc/view"},
+                            "submatches": [{"match": {"text": "https"}}],
+                        },
+                    }
+                ),
+            ]
+        )
+
+        findings, warnings = cli.parse_rga_output(payload, Path("/tmp/case"))
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(findings, [])
+
     def test_parse_trufflehog_output_tolerates_invalid_json(self) -> None:
         payload = '{"SourceMetadata":{"Data":{"Filesystem":{"file":"a.txt"}}},"DetectorName":"AWS","Raw":"AKIA..."}\nnope\n'
 

@@ -4,6 +4,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -37,14 +38,43 @@ SENSITIVE_FILENAMES = {
 }
 KEYWORD_RULES = {
     "password": ("credential", "high", 0.95),
-    "secret": ("credential", "high", 0.9),
-    "token": ("credential", "high", 0.9),
-    "apikey": ("credential", "high", 0.9),
-    "api_key": ("credential", "high", 0.9),
-    "bearer ": ("credential", "high", 0.9),
     "iban": ("financial-data", "medium", 0.7),
     "bsn": ("personal-data", "medium", 0.7),
 }
+SIGNAL_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, str, float]], ...] = (
+    (re.compile(r"\bpassword\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.95)),
+    (re.compile(r"\b(passwd|pwd)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.95)),
+    (re.compile(r"\b(secret|client_secret)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
+    (re.compile(r"\baws_secret_access_key\b", re.IGNORECASE), ("credential", "high", 0.95)),
+    (re.compile(r"\b(token|access_token|refresh_token)\b\s*[:=]", re.IGNORECASE), ("credential", "high", 0.9)),
+    (re.compile(r"\bapi[_-]?key\b\s*[:=]?", re.IGNORECASE), ("credential", "high", 0.9)),
+    (re.compile(r"\bbearer\s+[A-Za-z0-9._-]+", re.IGNORECASE), ("credential", "high", 0.9)),
+    (re.compile(r"\bset-cookie\b.*\bhttponly\b", re.IGNORECASE), ("credential", "high", 0.9)),
+    (re.compile(r"\biban\b", re.IGNORECASE), ("financial-data", "medium", 0.7)),
+    (re.compile(r"\bbsn\b", re.IGNORECASE), ("personal-data", "medium", 0.7)),
+    (re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"), ("sensitive-file", "critical", 0.99)),
+    (re.compile(r"\bopenssh private key\b", re.IGNORECASE), ("sensitive-file", "critical", 0.98)),
+)
+DOC_NOISE_FILENAMES = {
+    "license",
+    "license.txt",
+    "license.md",
+    "readme",
+    "readme.txt",
+    "readme.md",
+    "contributing.md",
+    "copying",
+    "notice",
+    "notice.txt",
+}
+NOISE_PHRASES = (
+    "capture the flag",
+    "mit license",
+    "copyright",
+    "please see individual challenges",
+    "can you find",
+    "hint:",
+)
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 REGISTERED_TEMPDIRS: set[Path] = set()
 ANSI_RESET = "\033[0m"
@@ -343,14 +373,35 @@ def deduplicate_findings(findings: list[Finding]) -> list[Finding]:
     )
 
 
-def classify_match(text: str) -> tuple[str, str, float]:
-    lowered = text.lower()
-    for token, rule in KEYWORD_RULES.items():
-        if token in lowered:
+def is_noise_evidence(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if sum(char.isalnum() for char in stripped) < 3:
+        return True
+    punctuation = sum(not char.isalnum() and not char.isspace() for char in stripped)
+    return punctuation >= max(4, len(stripped) - punctuation)
+
+
+def classify_match(text: str, source: str = "") -> tuple[str, str, float] | None:
+    if is_noise_evidence(text):
+        return None
+
+    stripped = text.strip()
+    lowered = stripped.lower()
+    source_name = Path(source).name.lower() if source else ""
+
+    for pattern, rule in SIGNAL_PATTERNS:
+        if pattern.search(stripped):
             return rule
-    if "private key" in lowered or "openssh" in lowered:
-        return ("sensitive-file", "critical", 0.98)
-    return ("credential", "medium", 0.6)
+
+    if stripped.startswith(("http://", "https://")):
+        return None
+    if source_name in DOC_NOISE_FILENAMES:
+        return None
+    if any(phrase in lowered for phrase in NOISE_PHRASES):
+        return None
+    return None
 
 
 def relative_source(target: Path, file_path: Path) -> str:
@@ -380,21 +431,21 @@ def filename_finding(target: Path, file_path: Path) -> Finding | None:
 def keyword_findings(target: Path, file_path: Path, content: str) -> list[Finding]:
     findings: list[Finding] = []
     for line_number, line in enumerate(content.splitlines(), start=1):
-        lowered = line.lower()
-        for token, (category, severity, confidence) in KEYWORD_RULES.items():
-            if token in lowered:
-                findings.append(
-                    Finding(
-                        source=relative_source(target, file_path),
-                        category=category,
-                        severity=severity,
-                        detector="built-in",
-                        evidence=line,
-                        line=line_number,
-                        confidence=confidence,
-                        metadata={},
-                    )
+        classification = classify_match(line, relative_source(target, file_path))
+        if classification is not None:
+            category, severity, confidence = classification
+            findings.append(
+                Finding(
+                    source=relative_source(target, file_path),
+                    category=category,
+                    severity=severity,
+                    detector="built-in",
+                    evidence=line,
+                    line=line_number,
+                    confidence=confidence,
+                    metadata={},
                 )
+            )
         for candidate in extract_digit_runs(line):
             if is_valid_bsn(candidate):
                 findings.append(
@@ -426,18 +477,7 @@ def keyword_findings(target: Path, file_path: Path, content: str) -> list[Findin
 
 
 def extract_digit_runs(text: str) -> list[str]:
-    values: list[str] = []
-    current: list[str] = []
-    for char in text:
-        if char.isdigit():
-            current.append(char)
-        else:
-            if current:
-                values.append("".join(current))
-            current = []
-    if current:
-        values.append("".join(current))
-    return values
+    return re.findall(r"\b\d{9}\b", text)
 
 
 def should_exclude(target: Path, file_path: Path, exclude_globs: Sequence[str]) -> bool:
@@ -636,7 +676,10 @@ def parse_rga_output(payload: str, target: Path) -> tuple[list[Finding], list[st
         source = data.get("path", {}).get("text", "")
         evidence = data.get("lines", {}).get("text", "").rstrip("\n")
         line = data.get("line_number")
-        category, severity, confidence = classify_match(evidence)
+        classification = classify_match(evidence, source)
+        if classification is None:
+            continue
+        category, severity, confidence = classification
         findings.append(
             Finding(
                 source=relative_source(target, Path(source)) if source else "<unknown>",
