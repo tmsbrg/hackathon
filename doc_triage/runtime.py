@@ -29,6 +29,14 @@ def _log_prefix(stage: str | None = None) -> str:
     return f"{prefix} [{stage}]" if stage else prefix
 
 
+def _format_elapsed_seconds(elapsed: float) -> str:
+    if elapsed < 1:
+        return f"{elapsed:.1f}s"
+    if elapsed < 10:
+        return f"{elapsed:.1f}s"
+    return f"{int(elapsed)}s"
+
+
 def verbose_log(enabled: bool, message: str) -> None:
     if enabled:
         print(f"{_log_prefix()} {message}")
@@ -61,8 +69,8 @@ class ProgressTicker:
         self.stop()
 
     def _render(self, suffix: str = "") -> str:
-        elapsed = int(time.monotonic() - self._start_time)
-        line = f"{_log_prefix(self.stage)} {self.message} ({elapsed}s)"
+        elapsed = time.monotonic() - self._start_time
+        line = f"{_log_prefix(self.stage)} {self.message} ({_format_elapsed_seconds(elapsed)})"
         return f"{line} {suffix}".rstrip()
 
     def _write(self, content: str) -> None:
