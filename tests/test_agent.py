@@ -1280,6 +1280,14 @@ class AgentModeTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertIn("subprocess", " ".join(errors))
 
+    def test_validate_generated_helper_source_rejects_write_calls_and_requires_jsonl(self) -> None:
+        errors = cli.validate_generated_helper_source(
+            "from pathlib import Path\nPath('/work/out.txt').write_text('x')\nprint('plain text')\n"
+        )
+
+        self.assertIn("blocked call: write_text", errors)
+        self.assertIn("helper must emit JSONL records via json.dumps", errors)
+
     @mock.patch("doc_triage.cli.shutil.which", return_value=None)
     def test_execute_generated_helper_warns_when_bwrap_missing(self, _: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1326,6 +1334,32 @@ class AgentModeTests(unittest.TestCase):
         self.assertIn("role=credential_hunter", report)
         self.assertIn("subagent=archive analyst", report)
         self.assertIn("archive contains credentials (archive_analyst, status=inconclusive)", report)
+
+    def test_role_prompts_omit_role_mission_and_discourage_role_justification(self) -> None:
+        prompt = cli.build_role_focus_prompt(
+            Path("/tmp/case"),
+            {"sample_files": ["docs/a.txt"]},
+            [],
+            [],
+            "infra_config_reviewer",
+            [cli.AgentHypothesis(label="Config lead", rationale="config nearby", role="infra_config_reviewer")],
+            [],
+            3,
+        )
+        review_prompt = cli.build_role_review_prompt(
+            Path("/tmp/case"),
+            {"sample_files": ["docs/a.txt"]},
+            "infra_config_reviewer",
+            [cli.AgentHypothesis(label="Config lead", rationale="config nearby", role="infra_config_reviewer")],
+            [],
+            [],
+        )
+
+        self.assertNotIn("role_mission", prompt)
+        self.assertNotIn("role_mission", review_prompt)
+        self.assertTrue(
+            any("Do not justify actions by repeating role scope or reviewer focus." in line for line in prompt["instructions"])
+        )
 
     def test_summarize_findings_includes_agent_stats(self) -> None:
         agent_run = cli.AgentRun(
