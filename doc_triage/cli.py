@@ -85,6 +85,7 @@ from .runtime import (
     handle_interrupt,
     install_signal_handlers,
     progress_log,
+    read_with_progress,
     register_active_process,
     register_closeable,
     register_tempdir,
@@ -1441,7 +1442,12 @@ def collect_ocr_findings(target: Path, files: list[Path], work_dir: Path) -> tup
         suffix = file_path.suffix.lower()
         if suffix in OCR_IMAGE_EXTENSIONS:
             stem = work_dir / file_path.stem
-            result = run_command(["tesseract", str(file_path), str(stem)])
+            result = run_command(
+                ["tesseract", str(file_path), str(stem)],
+                progress_stage="ocr",
+                progress_message=f"OCR {file_path.name}",
+                progress_enabled=True,
+            )
             if result.exit_code != 0:
                 warnings.append(f"OCR failed for {file_path.name}.")
                 continue
@@ -1474,10 +1480,20 @@ def extract_pdf_ocr_text(file_path: Path, work_dir: Path) -> tuple[str | None, s
 
     if ocrmypdf_path and pdftotext_path:
         output_pdf = work_dir / file_path.name
-        ocr_result = run_command([ocrmypdf_path, str(file_path), str(output_pdf)])
+        ocr_result = run_command(
+            [ocrmypdf_path, str(file_path), str(output_pdf)],
+            progress_stage="ocr",
+            progress_message=f"OCR PDF {file_path.name}",
+            progress_enabled=True,
+        )
         if ocr_result.exit_code == 0:
             text_path = work_dir / f"{file_path.stem}.txt"
-            text_result = run_command([pdftotext_path, str(output_pdf), str(text_path)])
+            text_result = run_command(
+                [pdftotext_path, str(output_pdf), str(text_path)],
+                progress_stage="ocr",
+                progress_message=f"Extract PDF text {file_path.name}",
+                progress_enabled=True,
+            )
             if text_result.exit_code == 0 and text_path.exists():
                 return text_path.read_text(encoding="utf-8", errors="ignore"), None
 
@@ -1485,7 +1501,14 @@ def extract_pdf_ocr_text(file_path: Path, work_dir: Path) -> tuple[str | None, s
         return None, f"PDF OCR failed for {file_path.name}."
 
     image_prefix = work_dir / file_path.stem
-    rasterize_result = run_command([pdftoppm_path, "-png", str(file_path), str(image_prefix)], timeout=60, max_output_chars=4000)
+    rasterize_result = run_command(
+        [pdftoppm_path, "-png", str(file_path), str(image_prefix)],
+        timeout=60,
+        max_output_chars=4000,
+        progress_stage="ocr",
+        progress_message=f"Rasterize PDF {file_path.name}",
+        progress_enabled=True,
+    )
     if rasterize_result.exit_code != 0:
         return None, f"PDF OCR failed for {file_path.name}."
     pages = sorted(work_dir.glob(f"{file_path.stem}-*.png"))
@@ -1493,7 +1516,14 @@ def extract_pdf_ocr_text(file_path: Path, work_dir: Path) -> tuple[str | None, s
         return None, f"PDF OCR failed for {file_path.name}."
     page_texts: list[str] = []
     for page in pages[:10]:
-        result = run_command([tesseract_path, str(page), "stdout"], timeout=60, max_output_chars=12000)
+        result = run_command(
+            [tesseract_path, str(page), "stdout"],
+            timeout=60,
+            max_output_chars=12000,
+            progress_stage="ocr",
+            progress_message=f"OCR page {page.name}",
+            progress_enabled=True,
+        )
         if result.exit_code != 0:
             continue
         page_texts.append(result.stdout)
@@ -1512,7 +1542,14 @@ def request_ollama_text(ollama_url: str, body: dict[str, object], timeout_second
     response = urlopen(request, timeout=timeout_seconds)
     register_closeable(response)
     try:
-        payload = json.loads(response.read().decode("utf-8"))
+        model_name = str(body.get("model", "ollama"))
+        raw_payload = read_with_progress(
+            True,
+            "llm",
+            f"Waiting for local inference from {model_name}",
+            lambda: response.read(),
+        )
+        payload = json.loads(raw_payload.decode("utf-8"))
     finally:
         unregister_closeable(response)
         response.close()

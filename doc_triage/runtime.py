@@ -5,8 +5,11 @@ import shutil
 import signal
 import stat
 import subprocess
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .constants import ANSI_COLORS, ANSI_RESET
 from .models import AgentAction, CommandResult
@@ -17,13 +20,70 @@ ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
 ACTIVE_CLOSEABLES: set[Any] = set()
 
 
+def _timestamp() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _log_prefix(stage: str | None = None) -> str:
+    prefix = f"[{_timestamp()}] [doc-triage]"
+    return f"{prefix} [{stage}]" if stage else prefix
+
+
 def verbose_log(enabled: bool, message: str) -> None:
     if enabled:
-        print(f"[doc-triage] {message}")
+        print(f"{_log_prefix()} {message}")
 
 
 def progress_log(enabled: bool, stage: str, message: str) -> None:
-    print(f"[doc-triage] [{stage}] {message}")
+    print(f"{_log_prefix(stage)} {message}")
+
+
+class ProgressTicker:
+    def __init__(self, enabled: bool, stage: str, message: str, interval_seconds: float = 1.0) -> None:
+        self.enabled = enabled
+        self.stage = stage
+        self.message = message
+        self.interval_seconds = interval_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_time = 0.0
+        self._line_length = 0
+
+    def __enter__(self) -> "ProgressTicker":
+        if not self.enabled:
+            return self
+        self._start_time = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.stop()
+
+    def _render(self, suffix: str = "") -> str:
+        elapsed = int(time.monotonic() - self._start_time)
+        line = f"{_log_prefix(self.stage)} {self.message} ({elapsed}s)"
+        return f"{line} {suffix}".rstrip()
+
+    def _write(self, content: str) -> None:
+        padding = max(0, self._line_length - len(content))
+        print("\r" + content + (" " * padding), end="", flush=True)
+        self._line_length = len(content)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self._write(self._render())
+            if self._stop_event.wait(self.interval_seconds):
+                break
+
+    def stop(self, suffix: str = "") -> None:
+        if not self.enabled:
+            return
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval_seconds + 0.2)
+        self._write(self._render(suffix))
+        print(flush=True)
 
 
 def summarize_agent_action(action: AgentAction) -> str:
@@ -97,9 +157,16 @@ def run_command(
     timeout: int = 30,
     cwd: Path | None = None,
     max_output_chars: int = 20000,
+    progress_stage: str | None = None,
+    progress_message: str | None = None,
+    progress_enabled: bool = False,
 ) -> CommandResult:
     process: subprocess.Popen[str] | None = None
+    ticker: ProgressTicker | None = None
     try:
+        if progress_stage and progress_message:
+            ticker = ProgressTicker(progress_enabled, progress_stage, progress_message)
+            ticker.__enter__()
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -114,6 +181,8 @@ def run_command(
         stdout_raw, stderr_raw = process.communicate(timeout=timeout)
         stdout, stdout_truncated = truncate_output(stdout_raw, max_output_chars)
         stderr, stderr_truncated = truncate_output(stderr_raw, max_output_chars)
+        if ticker is not None:
+            ticker.stop("done")
         return CommandResult(
             exit_code=process.returncode or 0,
             stdout=stdout,
@@ -122,6 +191,8 @@ def run_command(
             metadata={"stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated},
         )
     except subprocess.TimeoutExpired as exc:
+        if ticker is not None:
+            ticker.stop(f"timed out after {timeout}s")
         if process is not None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -140,6 +211,8 @@ def run_command(
             metadata={"stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated},
         )
     except FileNotFoundError as exc:
+        if ticker is not None:
+            ticker.stop("failed")
         return CommandResult(
             exit_code=127,
             stdout="",
@@ -150,6 +223,20 @@ def run_command(
     finally:
         if process is not None:
             unregister_active_process(process)
+        if ticker is not None and not ticker._stop_event.is_set():
+            ticker.stop("failed")
+
+
+def read_with_progress(
+    enabled: bool,
+    stage: str,
+    message: str,
+    reader: Callable[[], bytes],
+) -> bytes:
+    with ProgressTicker(enabled, stage, message) as ticker:
+        payload = reader()
+        ticker.stop("done")
+        return payload
 
 
 def tool_version(name: str) -> str:

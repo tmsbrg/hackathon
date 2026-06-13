@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -58,6 +59,15 @@ class ContractEdgeTests(unittest.TestCase):
 
         self.assertTrue(did_truncate)
         self.assertEqual(truncated, "first line\n")
+
+    def test_progress_log_includes_timestamp(self) -> None:
+        stdout = StringIO()
+
+        with mock.patch("sys.stdout", stdout):
+            cli.progress_log(True, "scan", "Starting scan")
+
+        rendered = stdout.getvalue().strip()
+        self.assertRegex(rendered, r"^\[\d{2}:\d{2}:\d{2}\] \[doc-triage\] \[scan\] Starting scan$")
 
     @mock.patch("doc_triage.cli.run_external_scanners", return_value=([], []))
     def test_scan_target_respects_exclude_globs(self, _: mock.Mock) -> None:
